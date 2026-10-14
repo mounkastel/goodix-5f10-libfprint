@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Known-answer tests for goodix_psk_tlv.py.
 
 Test vectors: see tests/ for the expected output. Run: ``python test_goodix_psk_tlv.py``.

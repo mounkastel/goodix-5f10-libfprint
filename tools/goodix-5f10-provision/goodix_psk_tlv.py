@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Goodix 27c6:5F10 presets ("TLV-1") packer - pure Python.
 
 Fixed constant of the sensor protocol; identical on every host.

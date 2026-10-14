@@ -7,7 +7,8 @@ bytes, wraps them and writes them to the MCU itself (command `0xE0`), keeping a
 host copy for its own reuse. Fixed constant of the sensor protocol; identical on every host, so the whole flow runs anywhere. The driver does this
 by default (opt out with `GOODIX5F10_AUTOPROVISION=0`); this directory is the
 standalone version of the same thing, plus the reference implementation the
-C code was checked against.
+C code was checked against. It is an independent implementation written for
+interoperability with the user's own sensor hardware and contains no vendor code.
 
 ## Files
 
@@ -88,6 +89,7 @@ If step 4 fails the key is **not** saved and nothing else is touched.
 
 ## Safety
 
+- Only use this on sensor hardware you own.
 - The CLI does nothing to the sensor unless `--write` (or `--psk` /
   `--psk-from-file`) is given.
 - The MCU PSK slot is rewritable; the Windows driver re-provisions on mismatch, so

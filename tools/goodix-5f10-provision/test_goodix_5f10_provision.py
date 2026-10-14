@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Offline tests for goodix_5f10_provision.py - no hardware, no pyusb needed.
 
 Runs the tool's own transport logic (command(), psk_read(), psk_write(),
@@ -29,7 +30,7 @@ def _le32(v: int) -> bytes:
 
 
 def parse_tlv2(payload: bytes):
-    """Extract the TLV-1 body from a command-0xE0 payload (what the MCU stores)."""
+    """Parse the TLV-1 body out of a command-0xE0 payload (what the MCU stores)."""
     assert len(payload) >= 36
     assert int.from_bytes(payload[0:4], "little") == 0xBB010002
     sealed_len = int.from_bytes(payload[4:8], "little") - 8

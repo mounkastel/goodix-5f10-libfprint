@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Goodix 27c6:5F10 TLS-PSK provisioning tool - Linux only, no Windows needed.
 
 The 5F10's TLS-PSK is *not* a factory secret: the host generates 32 random
