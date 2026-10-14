@@ -18,8 +18,10 @@
  */
 
 #include <glib.h>
+#include <string.h>
 
 #include "drivers/goodixtls/goodix5f10.h"
+#include "drivers/goodixtls/goodix5f10_psk.h"
 
 /* The table the sensor in this laptop runs, captured off the vendor exchange. Patching the
  * shipped template with this unit's OTP bytes has to land on it byte for byte, checksum
@@ -113,6 +115,142 @@ test_config_other_unit (void)
                    (config[len - 2] | (guint16) config[len - 1] << 8));
 }
 
+static guint32
+le32_at (const guint8 *p)
+{
+  return (guint32) p[0] | (guint32) p[1] << 8 | (guint32) p[2] << 16
+         | (guint32) p[3] << 24;
+}
+
+/* The 0xE0 write payload for a zeros PSK must come out structurally exact: tag2,
+ * sealed+8 length, the 324-byte sealed blob, 8-byte seed, then tag1 with the
+ * 102-byte TLV-1 body, padded to a multiple of 4 (452 here). */
+static void
+test_psk_packer (void)
+{
+  const guint8 psk[32] = { 0 };
+  g_autofree guint8 *blob = NULL;
+  g_autofree guint8 *body_ref = NULL;
+  guint8 want[GOODIX5F10_PSK_HASH_LEN];
+  gsize len = 0;
+  const guint8 *body_embedded;
+
+  g_assert_true (goodix5f10_psk_selftest ());
+
+  blob = goodix5f10_psk_build_write (psk, 324, &len);
+  g_assert_nonnull (blob);
+  g_assert_cmpuint (len, ==, 452);
+  g_assert_cmpuint (len % 4, ==, 0);
+
+  g_assert_cmphex (le32_at (blob), ==, 0xbb010002);
+  g_assert_cmphex (le32_at (blob + 4), ==, 324 + 8);
+
+  body_embedded = blob + 16 + 324; /* tag2(4) + len(4) + sealed(324) + seed(8) */
+  g_assert_cmphex (le32_at (body_embedded), ==, 0xbb010003);
+  g_assert_cmphex (le32_at (body_embedded + 4), ==, GOODIX5F10_TLV1_BODY_LEN);
+  body_embedded += 8;
+
+  /* The embedded body must be exactly the TLV-1 transformation of the key, and
+   * the host hash the chip must answer with is SHA256 of that body. Test
+   * vectors: see tests/ for the expected output. */
+  body_ref = g_malloc (GOODIX5F10_TLV1_BODY_LEN);
+  goodix5f10_psk_tlv1_body (psk, body_ref);
+  g_assert_cmpmem (body_embedded, GOODIX5F10_TLV1_BODY_LEN, body_ref,
+                   GOODIX5F10_TLV1_BODY_LEN);
+
+  goodix5f10_psk_host_hash (psk, want);
+  g_assert_cmpuint (want[GOODIX5F10_PSK_HASH_LEN - 1], ==, 0x89); /* zeros vector 0x...c389 */
+}
+
+/* The GOODIX5F10_AUTOPROVISION opt-out: unset and "1" stay enabled, exactly
+ * "0" disables, anything else warns once and stays enabled. */
+static void
+test_autoprovision_enabled (void)
+{
+  g_assert_true (goodix5f10_autoprovision_enabled (NULL));
+  g_assert_true (goodix5f10_autoprovision_enabled ("1"));
+  g_assert_false (goodix5f10_autoprovision_enabled ("0"));
+
+  /* Weird values warn (same log domain the helper logs to) but stay on. */
+  g_test_expect_message (G_LOG_DOMAIN, G_LOG_LEVEL_WARNING,
+                         "*GOODIX5F10_AUTOPROVISION*");
+  g_assert_true (goodix5f10_autoprovision_enabled ("banana"));
+  g_test_assert_expected_messages ();
+
+  g_test_expect_message (G_LOG_DOMAIN, G_LOG_LEVEL_WARNING,
+                         "*GOODIX5F10_AUTOPROVISION*");
+  g_assert_true (goodix5f10_autoprovision_enabled (""));
+  g_test_assert_expected_messages ();
+}
+
+/* The 0xE4 read decision, branch by branch, with no device involved. Test
+ * vectors: see tests/ for the expected output. */
+static void
+test_psk_decide (void)
+{
+  const guint8 zeros[GOODIX5F10_PSK_HASH_LEN] = { 0 };
+  guint8 zeros_hash[GOODIX5F10_PSK_HASH_LEN];
+  guint8 other[GOODIX5F10_PSK_HASH_LEN];
+
+  /* The helper's slot constants must stay identical to the driver's own. */
+  g_assert_cmphex (GOODIX5F10_PSK_SLOT_FLAGS, ==, GOODIX_5F10_PSK_FLAGS);
+  g_assert_cmpuint (GOODIX5F10_PSK_SLOT_LEN, ==, GOODIX_5F10_PSK_LEN);
+
+  g_assert_true (goodix5f10_psk_host_hash (zeros, zeros_hash));
+  g_assert_cmphex (zeros_hash[0], ==, 0xb5);
+  g_assert_cmphex (zeros_hash[1], ==, 0xe0);
+  memset (other, 0x7c, sizeof (other));
+
+  /* Match: the env setting is irrelevant, activation must continue. */
+  g_assert_cmpint (goodix5f10_psk_decide (TRUE, GOODIX_5F10_PSK_FLAGS,
+                                          GOODIX_5F10_PSK_LEN,
+                                          zeros_hash, sizeof (zeros_hash),
+                                          zeros, FALSE),
+                   ==, GOODIX5F10_PSK_MATCH);
+  g_assert_cmpint (goodix5f10_psk_decide (TRUE, GOODIX_5F10_PSK_FLAGS,
+                                          GOODIX_5F10_PSK_LEN,
+                                          zeros_hash, sizeof (zeros_hash),
+                                          zeros, TRUE),
+                   ==, GOODIX5F10_PSK_MATCH);
+
+  /* Mismatch: env picks rewrite vs fail-now (fail-now must not continue). */
+  g_assert_cmpint (goodix5f10_psk_decide (TRUE, GOODIX_5F10_PSK_FLAGS,
+                                          GOODIX_5F10_PSK_LEN,
+                                          other, sizeof (other),
+                                          zeros, FALSE),
+                   ==, GOODIX5F10_PSK_MISMATCH_FAIL);
+  g_assert_cmpint (goodix5f10_psk_decide (TRUE, GOODIX_5F10_PSK_FLAGS,
+                                          GOODIX_5F10_PSK_LEN,
+                                          other, sizeof (other),
+                                          zeros, TRUE),
+                   ==, GOODIX5F10_PSK_MISMATCH_AUTOPROVISION);
+
+  /* Missing slot (chip refused the read): same outcome either way, the caller
+   * provisions on env and fails otherwise. */
+  g_assert_cmpint (goodix5f10_psk_decide (FALSE, 0, 0, NULL, 0,
+                                          zeros, FALSE),
+                   ==, GOODIX5F10_PSK_MISSING);
+  g_assert_cmpint (goodix5f10_psk_decide (FALSE, GOODIX_5F10_PSK_FLAGS,
+                                          GOODIX_5F10_PSK_LEN, NULL, 0,
+                                          zeros, TRUE),
+                   ==, GOODIX5F10_PSK_MISSING);
+
+  /* Well-formed success carrying the wrong shape is never a match. */
+  g_assert_cmpint (goodix5f10_psk_decide (TRUE, 0xbb010003u,
+                                          GOODIX_5F10_PSK_LEN,
+                                          zeros_hash, sizeof (zeros_hash),
+                                          zeros, FALSE),
+                   ==, GOODIX5F10_PSK_REPLY_INVALID);
+  g_assert_cmpint (goodix5f10_psk_decide (TRUE, GOODIX_5F10_PSK_FLAGS, 16,
+                                          zeros_hash, 16,
+                                          zeros, FALSE),
+                   ==, GOODIX5F10_PSK_REPLY_INVALID);
+  g_assert_cmpint (goodix5f10_psk_decide (TRUE, GOODIX_5F10_PSK_FLAGS,
+                                          GOODIX_5F10_PSK_LEN, NULL, 0,
+                                          zeros, FALSE),
+                   ==, GOODIX5F10_PSK_REPLY_INVALID);
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -120,6 +258,10 @@ main (int argc, char *argv[])
 
   g_test_add_func ("/goodix5f10/config/this-unit", test_config_this_unit);
   g_test_add_func ("/goodix5f10/config/other-unit", test_config_other_unit);
+  g_test_add_func ("/goodix5f10/psk/packer", test_psk_packer);
+  g_test_add_func ("/goodix5f10/psk/decide", test_psk_decide);
+  g_test_add_func ("/goodix5f10/psk/autoprovision-enabled",
+                   test_autoprovision_enabled);
 
   return g_test_run ();
 }
