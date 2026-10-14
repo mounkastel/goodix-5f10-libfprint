@@ -1,0 +1,1656 @@
+/*
+ * Goodix TLS driver for libfprint -- chip 27c6:5F10 (Milan/ST411SEC family).
+ *
+ * Copyright (C) 2026 libfprint contributors
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+// Plain FpDevice driver (NOT FpImageDevice): the small 56x176 sensor does not yield
+// enough reproducible NBIS minutiae for cross-touch matching, so we match with the
+// sigfm (FAST-9 + BRIEF-256 + RANSAC) algorithm, like the equally small Goodix HTK32.
+// The FpDevice + host-side sigfm + raw-frame-gallery design follows the
+// AndyHazz/goodix53x5 driver (https://github.com/AndyHazz/goodix53x5-libfprint).
+//
+// Architecture:
+//   * Transport is reused verbatim from the goodixtls base (goodix.c / goodixtls.c):
+//     activation, TLS-PSK handshake (OpenSSL) with the per-device session key,
+//     MCU_GET_IMAGE.
+//   * The FpImageDevice scan layer is NOT used; this driver runs its own
+//     activate / capture / enroll / verify state machines and feeds each captured
+//     8-bit frame to sigfm.
+//
+// 5F10-specific empirical facts:
+//   * ENABLE_CHIP body is "01 02" (the generic helper emits "01 00").
+//   * RESET reply number is 1024; firmware string is "GF_ST411SEC_APP_12705";
+//     preset-PSK flags are 0xbb020003; MCU config payload is 224 bytes.
+//   * Sensor streams 9856 px decoded row-major as 176 scanlines x 56 px, presented
+//     STRAIGHT (no transpose) with ridges inverted dark (see process_to_8bit).
+//
+// The TLS-PSK session key is a host-generated 32-byte secret: the driver either
+// loads it from disk or generates one and writes it to the MCU with command
+// 0xE0 at activation (see goodix5f10_psk.[ch]), unless GOODIX5F10_AUTOPROVISION=0
+// opts out of all writes. The 32-byte preset-PSK "hash" the chip reports is
+// SHA256 of the packed key, not a factory secret. See load_secrets() and the
+// paths in goodix5f10.h.
+
+#include "fp-device.h"
+#include "fpi-device.h"
+#include "fpi-ssm.h"
+#include "gusb/gusb-device.h"
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <glib.h>
+#include <glib/gstdio.h>
+
+#include <openssl/ssl.h> // goodixtls.h references SSL/SSL_CTX types
+
+#include "drivers_api.h"
+#include "goodix.h"
+#include "goodix_proto.h"
+#include "goodixtls.h"
+#include "goodix5f10.h"
+#include "goodix5f10_psk.h"
+#include "sigfm.h"
+
+#define FP_COMPONENT "goodixtls5f10"
+
+// Sensor geometry. RAW frame on the wire = 8 + (56*176)/4*6 + 5 = 14797 bytes.
+#define GOODIX5F10_WIDTH 56
+#define GOODIX5F10_HEIGHT 176
+#define GOODIX5F10_SCAN_WIDTH 56
+#define GOODIX5F10_SCAN_HEIGHT 176
+#define GOODIX5F10_PIXELS (GOODIX5F10_WIDTH * GOODIX5F10_HEIGHT)
+#define GOODIX5F10_RAW_FRAME_SIZE \
+  (8 + (GOODIX5F10_SCAN_HEIGHT * GOODIX5F10_SCAN_WIDTH) / 4 * 6 + 5)
+
+// Enrollment follows the industry recipe for small patch sensors (Apple Touch ID, the
+// libfprint MOC drivers, the partial-fingerprint patent literature): collect a FIXED number
+// of quality samples into a multi-template gallery, where successive touches are meant to
+// OVERLAP so the gallery stays connected. We deliberately do NOT drop "already covered"
+// frames -- overlap is the glue that lets a verify touch landing between samples still match;
+// dropping it builds a disjoint gallery of islands (a coverage-guided dedup would do
+// exactly that, hurting FRR). Good coverage relies on the user varying finger
+// position across touches: the enroll API carries only a stage number plus the fixed
+// FP_DEVICE_RETRY_* codes, so there is NO channel to instruct "center" vs "edges" -- the UI
+// (fprintd/GNOME) only shows generic "reposition slightly" guidance. The driver just banks
+// one best-quality frame per touch until it has ENROLL_SAMPLES of them.
+//
+// ENROLL_SAMPLES (== nr_enroll_stages) is chosen by analogy to the narrow MOC drivers
+// (fpcmoc 25, elanmoc up to 17, synaptics/goodixmoc 8): 24 = 8 center + 16 edge touches.
+// FAR/FRR on this sensor are not yet characterised, so treat the count as a starting point.
+#define GOODIX5F10_ENROLL_SAMPLES 24  // gallery frames to collect (== nr_enroll_stages)
+#define GOODIX5F10_ENROLL_IGNORE_LIMIT 30  // consecutive low-quality touches before giving up
+// Minimum SIFT keypoints for an enroll frame to enter the gallery. Real ridge patches give
+// ~260 keypoints; an empty/noise frame gives very few. Set well below the real-frame count so
+// only degenerate frames are dropped (env-overridable for tuning).
+#define GOODIX5F10_ENROLL_MIN_KP  12
+
+// Multi-frame capture per single finger press. The sensor patch is tiny (~5x4 mm), so a
+// single touch covers only a fraction of the finger pad and a verify touch that lands on an
+// uncovered zone misses entirely (a miss scores 0, not "weak"; how much of the FRR that
+// accounts for I have not pinned down). A held
+// finger micro-shifts over ~1 s, so grabbing several back-to-back MCU_GET_IMAGE frames per
+// press yields slightly different patches. On verify this multiplies the chance one frame
+// overlaps the gallery (P(miss) ~ p^N); on enroll it widens gallery coverage. The frames in a
+// burst are not equally useful though: the signal fades out over a few grabs and comes back,
+// and across 8 bursts of 24 only 57 frames carried a finger at all (mean brightness per
+// position in the burst). A washed-out frame still yields a full set
+// of keypoints off the noise, so frame quality can't be judged by the keypoint count.
+#define GOODIX5F10_VERIFY_FRAMES 6
+#define GOODIX5F10_ENROLL_FRAMES 3
+
+// sigfm match gates:
+//   THRESHOLD  -- a per-sample sigfm score at/above this counts the sample as matching.
+//   BEST_MIN   -- the best single-sample score must reach this for an overall match.
+//   MIN_SAMPLES-- at least this many gallery samples must individually pass THRESHOLD.
+//
+// sigfm score gates for the buxel pure-C matcher (FAST-9 + BRIEF-256 + RANSAC).
+// MIN_SAMPLES is kept at 1: a high best-sample score already implies enough matching
+// samples, so the match is gated on BEST_MIN. These are starting values; FAR/FRR on
+// this sensor are not yet characterised.
+#define GOODIX5F10_SIGFM_THRESHOLD   10
+#define GOODIX5F10_SIGFM_BEST_MIN    10
+#define GOODIX5F10_SIGFM_MIN_SAMPLES 1
+
+/* Per-frame keypoint cap passed to sigfm_extract_ex. Our 56x176 frames
+ * saturate the upstream-default 128 cap (natural ceiling ~208 keypoints
+ * per frame). 192 is used as a starting point; higher values showed no
+ * apparent improvement. */
+#define GOODIX5F10_SIGFM_MAX_KP      192
+
+// ---- FDT (finger detection) ------------------------------------------------------------
+// The chip runs GOODIX5F10_FDT_CHANNELS capacitive detection channels. Every FDT command
+// answers with [irq u16][touch flag u16][one u16 reading per channel], and takes a
+// threshold table in the same channel order.
+#define GOODIX5F10_FDT_CHANNELS    10
+#define GOODIX5F10_FDT_REPLY_LEN   (4 + 2 * GOODIX5F10_FDT_CHANNELS)
+#define GOODIX5F10_FDT_PAYLOAD_LEN 34  // 2 header bytes, 10 threshold pairs, tail padding
+#define GOODIX5F10_FDT_THRESH_OFF  2
+// Offset added over the idle level when building a threshold, in the chip's half-scale
+// units. This is not the detection margin - the chip decides for itself, and it takes
+// roughly 25 below the threshold to fire: the deepest reading it left unflagged here was
+// 20 under, the shallowest it flagged was 28 under. Idle drift of a few units sits well
+// inside that, which is why the table can be rebuilt from any resting reading without the
+// wobble mattering. 2 is what the vendor stack used, and it reproduces fdt_reference_
+// thresholds below exactly.
+#define GOODIX5F10_FDT_DELTA       2
+
+// A baseline that comes back empty makes the subtraction below a no-op, and the touch ends
+// up preprocessed unlike every other one. Healthy frames here sit at 2420 of the 12-bit
+// range; the 550c driver saw dead ones averaging 0 to 10 (see the commit for their
+// write-up). 256 rejects those without judging exposure.
+#define GOODIX5F10_BASELINE_MIN_MEAN 256
+#define GOODIX5F10_BASELINE_RETRIES  8
+#define GOODIX5F10_BASELINE_RETRY_MS 120
+
+// Stamp carried as the first element of the stored gallery: four magic bytes, the version
+// of the frame pipeline, and the operating point the frames were taken at. A gallery is raw
+// frames, so both the pipeline and the operating point decide whether a stored print still
+// looks like what this sensor produces today. Bump the version whenever the pipeline changes.
+//
+// It rides inside the same "aay" as the frames rather than changing the type of fpi-data,
+// which means a driver built before this still reads the print: it takes every element of
+// the array whose length is a frame and skips the rest, so the stamp goes past it unnoticed.
+#define GOODIX5F10_PIPELINE_VERSION 1
+#define GOODIX5F10_STAMP_LEN 7
+G_STATIC_ASSERT (GOODIX5F10_STAMP_LEN != GOODIX5F10_PIXELS);
+
+typedef guint16 Goodix5f10Pix;
+
+// Automatic provisioning (on by default): the driver generates a 32-byte PSK
+// and writes it to the MCU during activation whenever there is no usable key
+// on disk, or the one on disk does not match the sensor. Set
+// GOODIX5F10_AUTOPROVISION=0 to opt out and keep the old read-only behaviour
+// (open fails if no key is present or it mismatches).
+#define GOODIX_5F10_AUTOPROVISION_ENV "GOODIX5F10_AUTOPROVISION"
+
+// Length of the host-backup section in the 0xE0 payload. The MCU stores it
+// verbatim and never reads it, so any length works -- we just keep a fixed shape.
+#define GOODIX_5F10_SEALED_LEN (324)
+
+struct _FpiDeviceGoodixTls5f10
+{
+  FpiDeviceGoodixTls parent;
+
+  FpiSsm       *task_ssm;
+
+  Goodix5f10Pix *calibration_img; // baseline (empty-sensor) frame, scan_w*scan_h
+  GPtrArray     *capture_frames;  // 8-bit frames (guint8*, WIDTH*HEIGHT) from the current press
+  guint          frames_target;   // how many frames to grab per press (enroll vs verify)
+  guint          baseline_retries; // consecutive no-signal baseline frames this press
+
+  GPtrArray *enroll_images;       // array of guint8* (8-bit frames) kept in the gallery
+
+  // fixed-count enrollment bookkeeping
+  guint      enroll_touches;      // total touches taken this enroll
+  guint      enroll_ignored;      // consecutive low-quality touches (no usable frames)
+  guint      enroll_target;       // gallery frames to collect (env-overridable)
+  guint      enroll_min_kp;       // min SIFT keypoints to accept a frame
+
+  // per-device factory calibration parsed from OTP (0xa6). Each calibration field
+  // is stored with triple redundancy (value, complement, duplicate); see parse_otp.
+  guint8     config[GOODIX5F10_CONFIG_LEN]; // the table as sent, rewritten per device
+  guint8     otp_dac;             // factory DAC (OTP[0x1F]/[0x1B]/[0x1A])
+  guint8     otp_tcode;           // factory TCODE (OTP[0x16]/[0x17]/[0x19])
+  gboolean   otp_dac_valid;       // FALSE -> otp_dac holds the development unit's value
+  gboolean   otp_tcode_valid;
+  guint8     sent_dac;            // what the config actually went out with, which is not
+  guint8     sent_tcode;          // the OTP when GOODIX5F10_NO_OTP_PATCH is set
+
+  // FDT threshold table sent with every FDT command, in wire form. Seeded from the
+  // reference table and replaced by one measured on this sensor; see update_fdt_base.
+  guint8     fdt_base[GOODIX5F10_FDT_PAYLOAD_LEN];
+  gboolean   fdt_base_live;       // TRUE once the table came from a live reading
+
+  // Per-device TLS session key. Loaded from disk, or generated + written to the
+  // MCU at ACTIVATE_CHECK_PSK unless GOODIX5F10_AUTOPROVISION=0 opts out.
+  guint8     tls_psk[GOODIX_5F10_PSK_LEN];
+  gchar     *psk_path;            // where tls_psk is (or will be) persisted
+  gboolean   psk_from_disk;       // tls_psk came from an existing file
+  gboolean   provisioning;        // a fresh key must be written at ACTIVATE_CHECK_PSK
+};
+
+G_DECLARE_FINAL_TYPE (FpiDeviceGoodixTls5f10, fpi_device_goodixtls5f10, FPI,
+                      DEVICE_GOODIXTLS5F10, FpiDeviceGoodixTls);
+G_DEFINE_TYPE (FpiDeviceGoodixTls5f10, fpi_device_goodixtls5f10,
+               FPI_TYPE_DEVICE_GOODIXTLS);
+
+// FDT threshold table captured on the development unit, kept only as the seed for the
+// first FDT command of a session. Every pair is that sensor's idle reading halved plus
+// GOODIX5F10_FDT_DELTA, duplicated across both bytes -- the packing the published 53x5
+// notes write as (v & 0xfffe) * 0x80 | v >> 1. Idle levels differ from sensor to sensor,
+// so this table describes one laptop and nothing else; update_fdt_base measures the real
+// one on first use.
+static const guint8 fdt_reference_thresholds[] = {
+  0x09, 0x01, 0xaf, 0xaf, 0xb1, 0xb1, 0xaf, 0xaf, 0xb3, 0xb3, 0xae, 0xae,
+  0xad, 0xad, 0xb4, 0xb4, 0xae, 0xae, 0xb1, 0xb1, 0xb3, 0xb3, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+G_STATIC_ASSERT (sizeof (fdt_reference_thresholds) == GOODIX5F10_FDT_PAYLOAD_LEN);
+
+// ---- frame decode / processing (copied from the goodix5xx base; small + self-contained)
+
+static void
+decode_frame (Goodix5f10Pix *frame, guint32 frame_size, const guint8 *raw_frame)
+{
+  Goodix5f10Pix *pix = frame;
+
+  for (guint32 i = 8; i != frame_size - 5; i += 6)
+    {
+      const guint8 *chunk = raw_frame + i;
+      *pix++ = ((chunk[0] & 0xf) << 8) + chunk[1];
+      *pix++ = (chunk[3] << 4) + (chunk[0] >> 4);
+      *pix++ = ((chunk[5] & 0xf) << 8) + chunk[2];
+      *pix++ = (chunk[4] << 4) + (chunk[5] >> 4);
+    }
+}
+
+// Ridge pixels read LOWER than the empty-sensor baseline, so (baseline - finger) is the
+// positive ridge signal; clamp at 0.
+static void
+linear_subtract_inplace (Goodix5f10Pix *src, const Goodix5f10Pix *by, guint len)
+{
+  for (guint n = 0; n != len; ++n)
+    src[n] = (by[n] > src[n]) ? (by[n] - src[n]) : 0;
+}
+
+static void
+squash_frame_linear (const Goodix5f10Pix *frame, guint8 *squashed, guint len)
+{
+  Goodix5f10Pix min = 0xffff, max = 0;
+
+  for (guint i = 0; i != len; ++i)
+    {
+      const Goodix5f10Pix p = frame[i];
+      if (p < min) min = p;
+      if (p > max) max = p;
+    }
+  for (guint i = 0; i != len; ++i)
+    {
+      const Goodix5f10Pix p = frame[i];
+      squashed[i] = (max - min == 0) ? 0 : (p - min) * 0xff / (max - min);
+    }
+}
+
+// The decoded buffer is already in row-major order for a HEIGHT x WIDTH (176 x 56) image:
+// consecutive WIDTH(56) decoded pixels form one scanline. Read it straight (NOT transposed)
+// and invert so ridges are DARK. The previous transpose (col*HEIGHT+row) SCRAMBLED the image
+// into a herringbone moire. The straight reshape(176,56) yields clean curved ridges;
+// the transpose yields garbage.
+// Returns a newly g_malloc'd WIDTH*HEIGHT 8-bit buffer (caller owns).
+static guint8 *
+process_to_8bit (const guint8 *squashed_native)
+{
+  guint8 *img = g_malloc (GOODIX5F10_PIXELS);
+
+  for (int row = 0; row != GOODIX5F10_HEIGHT; ++row)
+    for (int col = 0; col != GOODIX5F10_WIDTH; ++col)
+      img[col + row * GOODIX5F10_WIDTH] =
+        255 - squashed_native[col + row * GOODIX5F10_WIDTH];
+
+  const char *dump = g_getenv ("GOODIX5F10_DUMP");
+  if (dump)
+    {
+      static unsigned seq = 0;
+      char path[512];
+      g_snprintf (path, sizeof (path), "%s%03u.pgm", dump, seq++);
+      FILE *f = fopen (path, "wb");
+      if (f)
+        {
+          fprintf (f, "P5\n%d %d\n255\n", GOODIX5F10_WIDTH, GOODIX5F10_HEIGHT);
+          fwrite (img, 1, GOODIX5F10_PIXELS, f);
+          fclose (f);
+        }
+    }
+  return img;
+}
+
+// ---- generic SSM check callbacks ------------------------------------------------------
+
+static void
+check_none (FpDevice *dev, gpointer ssm, GError *error)
+{
+  if (error) { fpi_ssm_mark_failed (ssm, error); return; }
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+check_none_cmd (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err)
+{
+  if (err) { fpi_ssm_mark_failed (ssm, err); return; }
+  fpi_ssm_next_state (ssm);
+}
+
+// ---- FDT (finger detection) thresholds -------------------------------------------------
+
+static void
+dump_fdt_reply (const char *tag, guint8 *data, guint16 len)
+{
+  g_autofree gchar *hex = data_to_str (data, len);
+  g_autoptr (GString) chans = g_string_new (NULL);
+
+  fp_dbg ("FDT %s reply: %u bytes: %s", tag, len, hex);
+  if (len != GOODIX5F10_FDT_REPLY_LEN)
+    return;
+
+  for (guint i = 0; i < GOODIX5F10_FDT_CHANNELS; i++)
+    g_string_append_printf (chans, " %u",
+                            (guint) (data[4 + 2 * i] | (data[5 + 2 * i] << 8)));
+  fp_dbg ("FDT %s: irq 0x%04x, touch flag 0x%04x, channels:%s", tag,
+          (guint) (data[0] | (data[1] << 8)), (guint) (data[2] | (data[3] << 8)),
+          chans->str);
+}
+
+// Rebuild the FDT threshold table from a live idle reading.
+//
+// The table is per-unit: each channel's threshold is that sensor's resting level halved,
+// plus a small margin. Two sensors of the same model rest at different levels, so a table
+// captured on one of them puts another one's resting state on the wrong side of the
+// comparison -- FDT-down then returns without a finger and the driver captures air
+// (github issue #2). Measure it on the device in front of us instead.
+static void
+update_fdt_base (FpiDeviceGoodixTls5f10 *self, const char *tag,
+                 guint8 *data, guint16 len)
+{
+  const gboolean bootstrap = !self->fdt_base_live;
+  guint16 touch_flag;
+
+  if (len != GOODIX5F10_FDT_REPLY_LEN)
+    {
+      fp_warn ("FDT %s: reply is %u bytes, expected %u; keeping the current thresholds",
+               tag, len, (guint) GOODIX5F10_FDT_REPLY_LEN);
+      return;
+    }
+
+  // A reading taken with a finger on the sensor is not a resting level. The first reading
+  // of a session is taken regardless: until it lands, the thresholds belong to whichever
+  // unit the reference table was captured on, and anything measured here beats that.
+  touch_flag = data[2] | ((guint16) data[3] << 8);
+  if (touch_flag != 0 && !bootstrap)
+    return;
+
+  for (guint i = 0; i < GOODIX5F10_FDT_CHANNELS; i++)
+    {
+      const guint16 reading = data[4 + 2 * i] | ((guint16) data[5 + 2 * i] << 8);
+      const guint8 thresh = MIN ((reading >> 1) + GOODIX5F10_FDT_DELTA, 0xff);
+
+      self->fdt_base[GOODIX5F10_FDT_THRESH_OFF + 2 * i] = thresh;
+      self->fdt_base[GOODIX5F10_FDT_THRESH_OFF + 2 * i + 1] = thresh;
+    }
+  self->fdt_base_live = TRUE;
+
+  if (bootstrap)
+    {
+      g_autofree gchar *hex =
+        data_to_str (self->fdt_base + GOODIX5F10_FDT_THRESH_OFF,
+                     2 * GOODIX5F10_FDT_CHANNELS);
+
+      if (touch_flag != 0)
+        fp_warn ("FDT %s: first reading came with touch flag 0x%04x; the thresholds it "
+                 "yields may be off until the next capture", tag, touch_flag);
+      fp_dbg ("FDT thresholds measured on this sensor (from %s): %s", tag, hex);
+    }
+}
+
+// FDT-mode and FDT-up only answer once the sensor is clear, so their readings are resting
+// levels; FDT-down answers with a finger on it.
+static void
+check_fdt_mode_cmd (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err)
+{
+  if (err) { fpi_ssm_mark_failed (ssm, err); return; }
+  dump_fdt_reply ("mode", data, len);
+  update_fdt_base (FPI_DEVICE_GOODIXTLS5F10 (dev), "mode", data, len);
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+check_fdt_down_cmd (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err)
+{
+  if (err) { fpi_ssm_mark_failed (ssm, err); return; }
+  dump_fdt_reply ("down", data, len);
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+check_fdt_up_cmd (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err)
+{
+  if (err) { fpi_ssm_mark_failed (ssm, err); return; }
+  dump_fdt_reply ("up", data, len);
+  update_fdt_base (FPI_DEVICE_GOODIXTLS5F10 (dev), "up", data, len);
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+check_firmware (FpDevice *dev, gchar *firmware, gpointer ssm, GError *error)
+{
+  if (error) { fpi_ssm_mark_failed (ssm, error); return; }
+  fp_dbg ("Device firmware: \"%s\"", firmware);
+  if (!g_str_has_prefix (firmware, GOODIX_5F10_FIRMWARE_PREFIX))
+    {
+      fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                                             "Invalid device firmware: \"%s\"", firmware));
+      return;
+    }
+  if (strcmp (firmware, GOODIX_5F10_FIRMWARE_VERSION) != 0)
+    fp_warn ("Device firmware \"%s\" is not the \"%s\" this driver was developed against; "
+             "same family, but report anything that misbehaves",
+             firmware, GOODIX_5F10_FIRMWARE_VERSION);
+  fpi_ssm_next_state (ssm);
+}
+
+// ---- PSK provisioning (automatic unless GOODIX5F10_AUTOPROVISION=0) -------------
+//
+// The 5F10 TLS-PSK is generated by the host, not burned in at the factory. The
+// host picks 32 random bytes, wraps them with the static key described
+// in goodix5f10_psk.c, writes the blob with command 0xE0 and keeps a host copy for
+// itself. We can do the same with no extra runtime at all.
+
+// Persist the raw key so later opens can reuse it. Best effort: the key lives in
+// the sensor already, so a failure here only means the next open re-provisions.
+// `from_disk` selects the success message: a stored key being restored reads
+// differently from a freshly generated one.
+static void
+save_psk (const gchar *path, const guint8 psk[GOODIX_5F10_PSK_LEN],
+          gboolean from_disk)
+{
+  g_autofree gchar *dir = NULL;
+  g_autoptr (GError) err = NULL;
+
+  dir = g_path_get_dirname (path);
+  if (g_mkdir_with_parents (dir, 0700) != 0)
+    fp_warn ("could not create PSK dir \"%s\": %s", dir, g_strerror (errno));
+
+  if (!g_file_set_contents (path, (const gchar *) psk, GOODIX_5F10_PSK_LEN, &err))
+    {
+      fp_warn ("the sensor is provisioned, but the key could not be saved to "
+               "\"%s\" (%s); record the raw 32 bytes yourself or the next open "
+               "will start over", path, err->message);
+      return;
+    }
+  g_chmod (path, 0600);
+  if (from_disk)
+    fp_info ("re-provisioned the sensor from the stored PSK");
+  else
+    fp_info ("generated and saved a new PSK to \"%s\"", path);
+}
+
+static void
+provision_verify (FpDevice *dev, gboolean success, guint32 flags, guint8 *psk,
+                  guint16 length, gpointer ssm, GError *error)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+  guint8 want[GOODIX5F10_PSK_HASH_LEN];
+
+  if (error) { fpi_ssm_mark_failed (ssm, error); return; }
+
+  if (!success || flags != GOODIX_5F10_PSK_FLAGS || length != GOODIX_5F10_PSK_LEN
+      || !goodix5f10_psk_host_hash (self->tls_psk, want)
+      || memcmp (want, psk, GOODIX5F10_PSK_HASH_LEN) != 0)
+    {
+      fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+          "the PSK write did not take (read-back: success=%d flags=0x%08x len=%u)",
+          success, flags, length));
+      return;
+    }
+
+  /* psk_from_disk still tells where the key came from here: TRUE when the
+   * stored file key is being restored, FALSE for a freshly generated one
+   * (it flips to TRUE below). */
+  save_psk (self->psk_path, self->tls_psk, self->psk_from_disk);
+  self->provisioning = FALSE;
+  self->psk_from_disk = TRUE;
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+provision_written (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
+                   GError *error)
+{
+  if (error) { fpi_ssm_mark_failed (ssm, error); return; }
+  fp_dbg ("PSK write acknowledged; reading it back to verify");
+  goodix_send_preset_psk_read (dev, GOODIX_5F10_PSK_FLAGS, 0, provision_verify, ssm);
+}
+
+static void
+provision_start (FpDevice *dev, FpiSsm *ssm)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+  g_autofree guint8 *blob = NULL;
+  gsize len = 0;
+
+  blob = goodix5f10_psk_build_write (self->tls_psk, GOODIX_5F10_SEALED_LEN, &len);
+  if (blob == NULL || len == 0 || len > G_MAXUINT16)
+    {
+      fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED,
+                                             "failed to build the PSK write payload"));
+      return;
+    }
+
+  if (self->psk_from_disk)
+    fp_info ("writing the stored PSK to the sensor (command 0xE0, %" G_GSIZE_FORMAT
+             " bytes)", len);
+  else
+    fp_info ("writing a freshly generated PSK to the sensor (command 0xE0, %"
+             G_GSIZE_FORMAT " bytes)", len);
+  goodix_send_preset_psk_write (dev, blob, (guint16) len, provision_written, ssm);
+}
+
+static void
+check_preset_psk (FpDevice *dev, gboolean success, guint32 flags, guint8 *psk,
+                  guint16 length, gpointer ssm, GError *error)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+  const gboolean autoprovision =
+    goodix5f10_autoprovision_enabled (g_getenv (GOODIX_5F10_AUTOPROVISION_ENV));
+
+  if (error) { fpi_ssm_mark_failed (ssm, error); return; }
+
+  switch (goodix5f10_psk_decide (success, flags, length, psk, length,
+                                 self->tls_psk, autoprovision))
+    {
+    case GOODIX5F10_PSK_MATCH:
+      {
+        g_autofree gchar *dev_hash = data_to_str (psk, length);
+        fp_dbg ("device PSK hash 0x%s matches the stored key", dev_hash);
+        fpi_ssm_next_state (ssm);
+        return;
+      }
+
+    case GOODIX5F10_PSK_MISMATCH_AUTOPROVISION:
+      fp_warn ("device PSK differs from the stored key; re-provisioning");
+      break;
+
+    case GOODIX5F10_PSK_MISMATCH_FAIL:
+      {
+        /* A wrong key can never complete TLS: fail here with the cause named,
+         * instead of continuing into a handshake that dies as a timeout. The
+         * decision above already guarantees flags/length are the slot's own,
+         * so both hashes are 32 bytes; show the short forms. */
+        g_autofree gchar *dev_hash = data_to_str (psk, GOODIX5F10_PSK_HASH_LEN);
+        guint8 want[GOODIX5F10_PSK_HASH_LEN];
+        g_autofree gchar *want_hash = NULL;
+
+        if (goodix5f10_psk_host_hash (self->tls_psk, want))
+          want_hash = data_to_str (want, GOODIX5F10_PSK_HASH_LEN);
+        dev_hash[8] = '\0';
+        if (want_hash != NULL)
+          want_hash[8] = '\0';
+
+        fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+            "sensor TLS-PSK 0x%s does not match the stored key 0x%s and automatic "
+            "provisioning is off; refusing to continue with a key the sensor will "
+            "not accept. Set %s=1 to re-provision from the stored file, or restore "
+            "the PSK file that matches the sensor key.",
+            dev_hash, want_hash ? want_hash : "(unavailable)",
+            GOODIX_5F10_AUTOPROVISION_ENV));
+        return;
+      }
+
+    case GOODIX5F10_PSK_MISSING:
+    case GOODIX5F10_PSK_REPLY_INVALID:
+      if (autoprovision)
+        {
+          fp_info ("sensor reports no usable PSK; provisioning one now");
+          break;
+        }
+      fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+          "Unexpected PSK reply: success=%d flags=0x%08x len=%u. Automatic "
+          "provisioning is off; set %s=1 to enable it.", success, flags, length,
+          GOODIX_5F10_AUTOPROVISION_ENV));
+      return;
+
+    case GOODIX5F10_PSK_IO_ERROR:
+      fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED,
+                                            "failed to hash the stored PSK"));
+      return;
+    }
+
+  provision_start (dev, ssm);
+}
+
+static void
+check_reset (FpDevice *dev, gboolean success, guint16 number, gpointer ssm, GError *error)
+{
+  if (error) { fpi_ssm_mark_failed (ssm, error); return; }
+  if (!success)
+    {
+      fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED,
+                                             "Failed to reset device"));
+      return;
+    }
+  // The 511x reports 2048 and this one 1024, so it tracks the part, not anything we need.
+  fp_dbg ("Device reset number: %d", number);
+  if (number != GOODIX_5F10_RESET_NUMBER)
+    fp_warn ("Device reset number %d, expected %d; carrying on", number,
+             GOODIX_5F10_RESET_NUMBER);
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+check_success (FpDevice *dev, gboolean success, gpointer ssm, GError *error)
+{
+  if (error) { fpi_ssm_mark_failed (ssm, error); return; }
+  if (!success)
+    {
+      fpi_ssm_mark_failed (ssm, g_error_new (FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                                             "device command reported failure"));
+      return;
+    }
+  fpi_ssm_next_state (ssm);
+}
+
+// 5F10 wants ENABLE_CHIP body "01 02"; the generic helper emits "01 00".
+static void
+send_enable_chip (FpDevice *dev, GoodixNoneCallback callback, gpointer user_data)
+{
+  guint8 payload[] = {0x01, 0x02};
+  GoodixCallbackInfo *cb_info = malloc (sizeof (GoodixCallbackInfo));
+
+  cb_info->callback = G_CALLBACK (callback);
+  cb_info->user_data = user_data;
+  goodix_send_protocol (dev, GOODIX_CMD_ENABLE_CHIP, payload, sizeof (payload),
+                        NULL, TRUE, GOODIX_TIMEOUT, FALSE, goodix_receive_none, cb_info);
+}
+
+// Discard wrapper for state results we neither consume nor inspect (protocol nudges
+// whose only purpose is to advance the chip's internal state machine -- payload is
+// dropped, SSM is advanced).
+static void
+on_discard_default (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err)
+{
+  if (err) { fpi_ssm_mark_failed (ssm, err); return; }
+  fp_dbg ("discarding %u-byte reply (state passthrough)", len);
+  fpi_ssm_next_state (ssm);
+}
+
+// ---- activation SSM (run once at open) ------------------------------------------------
+
+enum activate_states {
+  ACTIVATE_READ_AND_NOP,
+  ACTIVATE_ENABLE_CHIP,
+  ACTIVATE_QUERY_MCU,            // MCU state ping after ENABLE_CHIP (init-sequence nudge)
+  ACTIVATE_NOP,
+  ACTIVATE_CHECK_FW_VER,
+  ACTIVATE_CHECK_PSK,
+  ACTIVATE_READ_OTP,
+  ACTIVATE_RESET,
+  ACTIVATE_SET_MCU_IDLE,
+  ACTIVATE_UPLOAD_MCU_CONFIG,
+  ACTIVATE_SET_POWERDOWN_SCAN_FREQUENCY,
+  ACTIVATE_NUM_STATES,
+};
+
+// 32-byte OTP block. Each calibration field is stored with triple redundancy: the value,
+// its bitwise complement, and a duplicate.
+#define GOODIX5F10_OTP_LEN 0x20
+
+// Each calibration byte is stored three times: the value, its complement and a copy. Any
+// two of the three agreeing is enough, which is what the vendor settles for too. 0xff is an
+// erased byte rather than a value. Returns 0 when nothing agrees.
+static guint8
+otp_pick (guint8 value, guint8 complement, guint8 duplicate)
+{
+  const guint8 expect = (guint8) ~complement;
+
+  if (duplicate != 0 && duplicate == value)
+    return value == 0xff ? 0 : value;
+  if (value != 0 && expect == value)
+    return value == 0xff ? 0 : value;
+  if (duplicate != 0 && expect == duplicate)
+    return duplicate == 0xff ? 0 : duplicate;
+  return 0;
+}
+
+// Read the OTP block during activation (the vendor init sequence does the same) and log
+// the per-device factory calibration for diagnostics. Non-fatal: the live baseline-subtract
+// path works regardless, so a bad or odd OTP never blocks activation.
+static void
+parse_otp (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm, GError *error)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+
+  if (error) { fpi_ssm_mark_failed (ssm, error); return; }
+
+  if (length < GOODIX5F10_OTP_LEN)
+    {
+      fp_warn ("OTP too short (%u < %u); skipping per-device calibration",
+               length, (guint) GOODIX5F10_OTP_LEN);
+      fpi_ssm_next_state (ssm);
+      return;
+    }
+
+  {
+    g_autofree gchar *raw = data_to_str (data, GOODIX5F10_OTP_LEN);
+    const guint8 dac = otp_pick (data[0x1F], data[0x1B], data[0x1A]);
+    const guint8 tcode = otp_pick (data[0x16], data[0x17], data[0x19]);
+
+    fp_dbg ("OTP: %s", raw);
+
+    // Falling back to the development unit's numbers rather than to the table's own: the
+    // placeholder in there is the vendor's "not personalised yet" value and would leave the
+    // sensor with no usable signal. The vendor can be laxer here because it validates the
+    // OTP checksums first, which we do not.
+    self->otp_dac_valid = (dac != 0);
+    self->otp_tcode_valid = (tcode != 0);
+    self->otp_dac = self->otp_dac_valid ? dac : GOODIX5F10_DEV_DAC;
+    self->otp_tcode = self->otp_tcode_valid ? tcode : GOODIX5F10_DEV_TCODE;
+
+    if (self->otp_dac_valid)
+      fp_dbg ("OTP factory DAC = 0x%02x", self->otp_dac);
+    else
+      fp_warn ("OTP DAC is unreadable; falling back to 0x%02x", self->otp_dac);
+    if (self->otp_tcode_valid)
+      fp_dbg ("OTP factory TCODE = 0x%02x", self->otp_tcode);
+    else
+      fp_warn ("OTP TCODE is unreadable; falling back to 0x%02x", self->otp_tcode);
+  }
+
+  fpi_ssm_next_state (ssm);
+}
+
+// ---- MCU config ------------------------------------------------------------------------
+// Three entries in the table are per-unit, and all three come out of two OTP bytes. Which
+// entry lives in which section matters: tag 0x005c appears in three sections and only the
+// one in section 4 is calibration, so a search across the whole table would rewrite two
+// entries that are meant to stay put.
+#define GOODIX5F10_CONFIG_SECTIONS  8
+#define GOODIX5F10_CONFIG_DAC_TAG   0x0220
+#define GOODIX5F10_CONFIG_TCODE_TAG 0x005c
+#define GOODIX5F10_CONFIG_DELTA_TAG 0x0082
+#define GOODIX5F10_CONFIG_DAC_SEC   0
+#define GOODIX5F10_CONFIG_DELTA_SEC 2
+#define GOODIX5F10_CONFIG_TCODE_SEC 4
+
+// The table as the vendor ships it, before any per-device rewriting. Layout: a leading
+// byte, eight (base, size) section pairs, then 4-byte entries of u16 tag and u16 value, and
+// the table's own 16-bit checksum in the last two bytes. The chip's inner length is 225 =
+// these 224 bytes plus one checksum byte that goodix_send_upload_config_mcu() appends.
+//
+// Three entries carry one unit's factory calibration and the vendor rewrites them from that
+// unit's OTP before upload; here they hold its placeholder values (tag 0x0220 = 0x1008,
+// 0x0082 = 0x1580, 0x005c = 0x0080). The same tags and the same arithmetic turn up in
+// goodix-fp-dump for the neighbouring parts -- driver_51x0.py writes tag 0x0220 as
+// (dac << 4) | 8, driver_53x5.py patches 0x220, 0x5c and 0x82 out of its calibration struct.
+static const guint8 goodix_5f10_config[] = {
+  0x30, 0x11, 0x64, 0x75, 0x00, 0x75, 0x2c, 0xa1, 0x1c, 0xbd, 0x18, 0xd5,
+  0x00, 0xd5, 0x00, 0xd5, 0x00, 0xba, 0x00, 0x00, 0x80, 0xca, 0x00, 0x06,
+  0x00, 0x84, 0x00, 0xbe, 0xb2, 0x86, 0x00, 0xc5, 0xb9, 0x88, 0x00, 0xb5,
+  0xad, 0x8a, 0x00, 0x9d, 0x95, 0x8c, 0x00, 0x00, 0xbe, 0x8e, 0x00, 0x00,
+  0xc5, 0x90, 0x00, 0x00, 0xb5, 0x92, 0x00, 0x00, 0x9d, 0x94, 0x00, 0x00,
+  0xaf, 0x96, 0x00, 0x00, 0xbf, 0x98, 0x00, 0x00, 0xb6, 0x9a, 0x00, 0x00,
+  0xa7, 0xd2, 0x00, 0x00, 0x00, 0xd4, 0x00, 0x00, 0x00, 0xd6, 0x00, 0x00,
+  0x00, 0xd8, 0x00, 0x00, 0x00, 0x12, 0x00, 0x03, 0x04, 0xd0, 0x00, 0x00,
+  0x00, 0x70, 0x00, 0x00, 0x00, 0x72, 0x00, 0x78, 0x56, 0x74, 0x00, 0x34,
+  0x12, 0x20, 0x00, 0x10, 0x40, 0x20, 0x02, 0x08, 0x10, 0x2a, 0x01, 0x82,
+  0x03, 0x22, 0x00, 0x01, 0x20, 0x24, 0x00, 0x14, 0x00, 0x80, 0x00, 0x01,
+  0x04, 0x5c, 0x00, 0x00, 0x01, 0x56, 0x00, 0x0c, 0x24, 0x58, 0x00, 0x05,
+  0x00, 0x32, 0x00, 0x08, 0x02, 0x66, 0x00, 0x00, 0x02, 0x7c, 0x00, 0x00,
+  0x38, 0x82, 0x00, 0x80, 0x15, 0x2a, 0x01, 0x08, 0x00, 0x5c, 0x00, 0x80,
+  0x00, 0x54, 0x00, 0x00, 0x01, 0x62, 0x00, 0x38, 0x04, 0x64, 0x00, 0x10,
+  0x00, 0x66, 0x00, 0x00, 0x02, 0x7c, 0x00, 0x01, 0x38, 0x2a, 0x01, 0x08,
+  0x00, 0x5c, 0x00, 0x80, 0x00, 0x52, 0x00, 0x08, 0x00, 0x54, 0x00, 0x00,
+  0x01, 0x66, 0x00, 0x00, 0x02, 0x7c, 0x00, 0x01, 0x38, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc2, 0x1d};
+G_STATIC_ASSERT (sizeof (goodix_5f10_config) == GOODIX5F10_CONFIG_LEN);
+
+const guint8 *
+goodix5f10_config_template (gsize *len)
+{
+  *len = sizeof (goodix_5f10_config);
+  return goodix_5f10_config;
+}
+
+static void
+config_set_checksum (guint8 *config, gsize len)
+{
+  guint32 checksum = 0xa5a5;
+
+  for (gsize i = 0; i + 2 < len; i += 2)
+    checksum = (checksum + (config[i] | ((guint16) config[i + 1] << 8))) & 0xffff;
+  checksum = 0x10000 - checksum;
+  config[len - 2] = checksum & 0xff;
+  config[len - 1] = (checksum >> 8) & 0xff;
+}
+
+static gboolean
+config_entry_offset (const guint8 *config, gsize len, guint section, guint16 tag, guint *out)
+{
+  guint base, end;
+
+  if (section >= GOODIX5F10_CONFIG_SECTIONS)
+    return FALSE;
+
+  base = config[1 + 2 * section];
+  end = MIN (base + config[2 + 2 * section], len);
+  for (guint entry = base; entry + 4 <= end; entry += 4)
+    if ((config[entry] | ((guint16) config[entry + 1] << 8)) == tag)
+      {
+        *out = entry;
+        return TRUE;
+      }
+  return FALSE;
+}
+
+// keep_low_byte is for tag 0x0082, where only the top half is the delta.
+static void
+config_set_entry (guint8 *config, gsize len, guint section, guint16 tag, guint16 value,
+                  gboolean keep_low_byte)
+{
+  guint entry;
+  guint16 old;
+
+  if (!config_entry_offset (config, len, section, tag, &entry))
+    {
+      fp_warn ("config: no tag 0x%04x in section %u, leaving the table as it is", tag, section);
+      return;
+    }
+
+  old = config[entry + 2] | ((guint16) config[entry + 3] << 8);
+  if (keep_low_byte)
+    value = (value & 0xff00) | (old & 0x00ff);
+  fp_dbg ("config sec%u tag 0x%04x: 0x%04x -> 0x%04x", section, tag, old, value);
+  config[entry + 2] = value & 0xff;
+  config[entry + 3] = value >> 8;
+}
+
+// DAC is the analog offset of the read path; TCODE drives the image integration time and,
+// through it, the margin the chip wants before it calls a channel touched. The arithmetic
+// is the vendor's; goodix-fp-dump derives the same two numbers the same way for the
+// neighbouring parts.
+void
+goodix5f10_config_patch_from_otp (guint8 *config, gsize len, guint8 dac, guint8 tcode)
+{
+  const guint16 image_tcode = (guint16) ((((guint) tcode >> 4) + 1) * 16);
+  const guint tmp = ((((guint) tcode & 0xf) + 2) * 25600u) / image_tcode;
+  const guint16 fdt_delta = (guint16) ((tmp / 3) >> 4) & 0xff;
+
+  config_set_entry (config, len, GOODIX5F10_CONFIG_DAC_SEC, GOODIX5F10_CONFIG_DAC_TAG,
+                    ((guint16) dac << 4) | 8, FALSE);
+  config_set_entry (config, len, GOODIX5F10_CONFIG_TCODE_SEC, GOODIX5F10_CONFIG_TCODE_TAG,
+                    image_tcode, FALSE);
+  config_set_entry (config, len, GOODIX5F10_CONFIG_DELTA_SEC, GOODIX5F10_CONFIG_DELTA_TAG,
+                    (guint16) (fdt_delta << 8), TRUE);
+  config_set_checksum (config, len);
+}
+
+static void
+activate_run_state (FpiSsm *ssm, FpDevice *dev)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case ACTIVATE_READ_AND_NOP:
+      goodix_start_read_loop (dev);
+      goodix_send_nop (dev, check_none, ssm);
+      break;
+    case ACTIVATE_ENABLE_CHIP:
+      send_enable_chip (dev, check_none, ssm);
+      break;
+    case ACTIVATE_QUERY_MCU:
+      // Init-sequence nudge. The reply payload (MCU state struct) is not consumed:
+      // only firing the command matters so the chip's internal state machine matches
+      // what subsequent steps expect.
+      goodix_send_query_mcu_state (dev, on_discard_default, ssm);
+      break;
+    case ACTIVATE_NOP:
+      goodix_send_nop (dev, check_none, ssm);
+      break;
+    case ACTIVATE_CHECK_FW_VER:
+      goodix_send_query_firmware_version (dev, check_firmware, ssm);
+      break;
+    case ACTIVATE_CHECK_PSK:
+      goodix_send_preset_psk_read (dev, GOODIX_5F10_PSK_FLAGS, 0, check_preset_psk, ssm);
+      break;
+    case ACTIVATE_READ_OTP:
+      goodix_send_read_otp (dev, parse_otp, ssm);
+      break;
+    case ACTIVATE_RESET:
+      goodix_send_reset (dev, TRUE, 20, check_reset, ssm);
+      break;
+    case ACTIVATE_SET_MCU_IDLE:
+      goodix_send_mcu_switch_to_idle_mode (dev, 20, check_none, ssm);
+      break;
+    case ACTIVATE_UPLOAD_MCU_CONFIG:
+      memcpy (self->config, goodix_5f10_config, sizeof (self->config));
+      if (g_getenv ("GOODIX5F10_NO_OTP_PATCH") != NULL)
+        {
+          fp_dbg ("GOODIX5F10_NO_OTP_PATCH set, running at the development unit's point");
+          self->sent_dac = GOODIX5F10_DEV_DAC;
+          self->sent_tcode = GOODIX5F10_DEV_TCODE;
+        }
+      else
+        {
+          self->sent_dac = self->otp_dac;
+          self->sent_tcode = self->otp_tcode;
+        }
+      goodix5f10_config_patch_from_otp (self->config, sizeof (self->config),
+                                        self->sent_dac, self->sent_tcode);
+      goodix_send_upload_config_mcu (dev, self->config, sizeof (self->config), NULL,
+                                     check_success, ssm);
+      break;
+    case ACTIVATE_SET_POWERDOWN_SCAN_FREQUENCY:
+      goodix_send_set_powerdown_scan_frequency (dev, 100, check_success, ssm);
+      break;
+    }
+}
+
+static void
+open_tls_complete (FpDevice *dev, gpointer user_data, GError *error)
+{
+  fpi_device_open_complete (dev, error);
+}
+
+static void
+activate_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+
+  self->task_ssm = NULL;
+  if (error)
+    {
+      fp_err ("failed during activation: %s", error->message);
+      fpi_device_open_complete (dev, error);
+      return;
+    }
+  // Bring up the real TLS-PSK channel; open completes when the handshake finishes.
+  goodix_tls_init (dev, open_tls_complete, NULL);
+}
+
+// ---- capture sub-SSM: one finger press -> one processed 8-bit frame -------------------
+
+enum capture_states {
+  CAP_QUERY_MCU,
+  CAP_FDT_MODE,
+  CAP_CAL_FDT_UP,
+  CAP_CAL_NAV0,
+  CAP_CAL_GET_IMG,
+  CAP_FDT_DOWN,
+  CAP_GET_IMG,
+  CAP_GET_IMG_REPEAT, // loop CAP_GET_IMG until frames_target frames are collected
+  CAP_FDT_UP,
+  CAP_NUM_STATES,
+};
+
+static void
+on_baseline_img (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+  g_autofree Goodix5f10Pix *frame = NULL;
+  Goodix5f10Pix min = 0xffff, max = 0;
+  guint64 total = 0;
+  double mean;
+
+  if (err) { fpi_ssm_mark_failed (ssm, err); return; }
+  if (len != GOODIX5F10_RAW_FRAME_SIZE)
+    {
+      fpi_ssm_mark_failed (ssm, g_error_new (FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
+                                             "unexpected baseline frame size %u (expected %u)",
+                                             len, (guint) GOODIX5F10_RAW_FRAME_SIZE));
+      return;
+    }
+
+  frame = g_malloc0 (GOODIX5F10_PIXELS * sizeof (Goodix5f10Pix));
+  decode_frame (frame, len, data);
+
+  for (guint i = 0; i < GOODIX5F10_PIXELS; i++)
+    {
+      const Goodix5f10Pix px = frame[i];
+
+      total += px;
+      if (px < min) min = px;
+      if (px > max) max = px;
+    }
+  mean = (double) total / GOODIX5F10_PIXELS;
+  fp_dbg ("baseline frame: mean %.1f, min %u, max %u", mean, (guint) min, (guint) max);
+
+  if (mean < GOODIX5F10_BASELINE_MIN_MEAN)
+    {
+      if (self->baseline_retries < GOODIX5F10_BASELINE_RETRIES)
+        {
+          self->baseline_retries++;
+          fp_dbg ("baseline frame carries no signal (mean %.1f); retrying (%u/%u)",
+                  mean, self->baseline_retries, (guint) GOODIX5F10_BASELINE_RETRIES);
+          fpi_ssm_jump_to_state_delayed (ssm, CAP_CAL_NAV0, GOODIX5F10_BASELINE_RETRY_MS);
+          return;
+        }
+      fpi_ssm_mark_failed (ssm, g_error_new (FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
+                                             "baseline frame carried no signal after %u attempts",
+                                             (guint) GOODIX5F10_BASELINE_RETRIES));
+      return;
+    }
+
+  g_free (self->calibration_img);
+  self->calibration_img = g_steal_pointer (&frame);
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+on_capture_img (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+
+  // Tolerate a read error once we already hold at least one frame: the finger was likely
+  // lifted mid-burst. Release with FDT_UP and proceed with what we collected.
+  if (err)
+    {
+      if (self->capture_frames && self->capture_frames->len > 0)
+        {
+          fp_dbg ("capture: tolerated read error after %u frame(s): %s",
+                  self->capture_frames->len, err->message);
+          g_error_free (err);
+          fpi_ssm_jump_to_state (ssm, CAP_FDT_UP);
+          return;
+        }
+      fpi_ssm_mark_failed (ssm, err);
+      return;
+    }
+  if (len != GOODIX5F10_RAW_FRAME_SIZE)
+    {
+      if (self->capture_frames && self->capture_frames->len > 0)
+        {
+          fp_dbg ("capture: tolerated short frame %u after %u frame(s)",
+                  len, self->capture_frames->len);
+          fpi_ssm_jump_to_state (ssm, CAP_FDT_UP);
+          return;
+        }
+      fpi_ssm_mark_failed (ssm, g_error_new (FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
+                                             "unexpected frame size %u (expected %u)",
+                                             len, (guint) GOODIX5F10_RAW_FRAME_SIZE));
+      return;
+    }
+
+  Goodix5f10Pix *raw = g_malloc0 (GOODIX5F10_PIXELS * sizeof (Goodix5f10Pix));
+  decode_frame (raw, len, data);
+  if (self->calibration_img)
+    linear_subtract_inplace (raw, self->calibration_img, GOODIX5F10_PIXELS);
+  guint8 *squashed = g_malloc0 (GOODIX5F10_PIXELS);
+  squash_frame_linear (raw, squashed, GOODIX5F10_PIXELS);
+  g_free (raw);
+
+  g_ptr_array_add (self->capture_frames, process_to_8bit (squashed));
+  g_free (squashed);
+
+  fpi_ssm_next_state (ssm); // -> CAP_GET_IMG_REPEAT
+}
+
+static void
+capture_run_state (FpiSsm *ssm, FpDevice *dev)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+  const guint8 *fdt = self->fdt_base;
+  const guint16 fdt_len = sizeof (self->fdt_base);
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case CAP_QUERY_MCU:
+      {
+        g_clear_pointer (&self->capture_frames, g_ptr_array_unref);
+        self->capture_frames = g_ptr_array_new_with_free_func (g_free);
+        self->baseline_retries = 0;
+        if (self->frames_target == 0)
+          self->frames_target = 1;
+      }
+      goodix_send_query_mcu_state (dev, check_none_cmd, ssm);
+      break;
+    case CAP_FDT_MODE:
+      goodix_send_mcu_switch_to_fdt_mode (dev, fdt, fdt_len, NULL, check_fdt_mode_cmd, ssm);
+      break;
+    case CAP_CAL_FDT_UP:
+      goodix_send_mcu_switch_to_fdt_up (dev, fdt, fdt_len, NULL, check_fdt_up_cmd, ssm);
+      break;
+    case CAP_CAL_NAV0:
+      goodix_send_nav_0 (dev, check_none_cmd, ssm);
+      break;
+    case CAP_CAL_GET_IMG:
+      goodix_tls_read_image (dev, on_baseline_img, ssm);
+      break;
+    case CAP_FDT_DOWN:
+      goodix_send_mcu_switch_to_fdt_down (dev, fdt, fdt_len, NULL, check_fdt_down_cmd, ssm);
+      break;
+    case CAP_GET_IMG:
+      goodix_tls_read_image (dev, on_capture_img, ssm);
+      break;
+    case CAP_GET_IMG_REPEAT:
+      {
+        // Grab more frames from the same press until we hit the target. Don't re-arm between
+        // grabs: FDT_DOWN on a held finger would block waiting for a down-edge that already
+        // happened, and a NAV0 in here costs far more than it looks - it stops the signal from
+        // recovering mid-burst: 57 usable frames across 8 bursts of 24 without it, 10 with.
+        if (self->capture_frames->len < self->frames_target)
+          fpi_ssm_jump_to_state (ssm, CAP_GET_IMG);
+        else
+          fpi_ssm_jump_to_state (ssm, CAP_FDT_UP);
+      }
+      break;
+    case CAP_FDT_UP:
+      goodix_send_mcu_switch_to_fdt_up (dev, fdt, fdt_len, NULL, check_fdt_up_cmd, ssm);
+      break;
+    }
+}
+
+// ---- enroll SSM -----------------------------------------------------------------------
+
+enum enroll_states {
+  ENROLL_CAPTURE,
+  ENROLL_PROCESS,
+  ENROLL_NEXT,
+  ENROLL_NUM_STATES,
+};
+
+static guint
+env_uint (const char *name, guint fallback)
+{
+  const char *v = g_getenv (name);
+  if (!v || !*v)
+    return fallback;
+  return (guint) g_ascii_strtoull (v, NULL, 10);
+}
+
+static void
+enroll_run_state (FpiSsm *ssm, FpDevice *dev)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case ENROLL_CAPTURE:
+      fpi_ssm_start_subsm (ssm, fpi_ssm_new (dev, capture_run_state, CAP_NUM_STATES));
+      break;
+    case ENROLL_PROCESS:
+      {
+        // One sample per touch: pick the highest-quality frame of this press's burst and bank
+        // it. We keep EVERY touch that yields a frame above the keypoint gate -- no novelty/
+        // overlap drop. Overlap between touches is wanted (it keeps the gallery connected); the
+        // center->edges placement that produces it is guided by the UI, not enforced here.
+        gint best_idx = -1;
+        int  best_kp = -1;
+        guint n = self->capture_frames ? self->capture_frames->len : 0;
+
+        for (guint i = 0; i < n; i++)
+          {
+            guint8 *img = g_ptr_array_index (self->capture_frames, i);
+            SigfmImgInfo *info = sigfm_extract_ex (img, GOODIX5F10_WIDTH, GOODIX5F10_HEIGHT, GOODIX5F10_SIGFM_MAX_KP);
+            int kp = info ? sigfm_keypoints_count (info) : -1;
+
+            if (kp > best_kp)
+              { best_kp = kp; best_idx = (gint) i; }
+            if (info)
+              sigfm_free_info (info);
+          }
+
+        if (best_idx >= 0 && best_kp >= (int) self->enroll_min_kp)
+          {
+            // Move the chosen frame into the gallery; the rest of the burst is freed when
+            // capture_frames is unref'd (its free func is g_free; the stolen slot is NULLed).
+            guint8 *keep = g_ptr_array_index (self->capture_frames, best_idx);
+            g_ptr_array_index (self->capture_frames, best_idx) = NULL;
+            g_ptr_array_add (self->enroll_images, keep);
+
+            self->enroll_touches++;
+            self->enroll_ignored = 0;
+            guint have = self->enroll_images->len;
+            fp_info ("enroll sample %u/%u, touch %u, best %d keypoints",
+                     have, self->enroll_target, self->enroll_touches, best_kp);
+            fpi_device_enroll_progress (dev, (gint) have, NULL, NULL);
+          }
+        else
+          {
+            // Poor contact / not a finger: don't advance the sample count, just re-prompt.
+            self->enroll_ignored++;
+            fp_dbg ("enroll: touch ignored (%u in a row), best %d keypoints (< %u)",
+                    self->enroll_ignored, best_kp, self->enroll_min_kp);
+          }
+
+        g_clear_pointer (&self->capture_frames, g_ptr_array_unref);
+
+        if (self->enroll_ignored >= GOODIX5F10_ENROLL_IGNORE_LIMIT)
+          {
+            fpi_ssm_mark_failed (ssm, g_error_new (FP_DEVICE_ERROR,
+                                                   FP_DEVICE_ERROR_DATA_INVALID,
+                                                   "too many low-quality scans; check finger "
+                                                   "placement and sensor"));
+            break;
+          }
+        fpi_ssm_next_state (ssm);
+      }
+      break;
+    case ENROLL_NEXT:
+      // Stop on a fixed count of accepted samples (the industry model); no zone/coverage gate.
+      if (self->enroll_images->len >= self->enroll_target)
+        {
+          fp_info ("enroll complete: %u gallery frames over %u touches",
+                   self->enroll_images->len, self->enroll_touches);
+          fpi_ssm_mark_completed (ssm);
+        }
+      else
+        fpi_ssm_jump_to_state (ssm, ENROLL_CAPTURE);
+      break;
+    }
+}
+
+static void
+enroll_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+
+  self->task_ssm = NULL;
+  if (error)
+    {
+      g_clear_pointer (&self->enroll_images, g_ptr_array_unref);
+      g_clear_pointer (&self->capture_frames, g_ptr_array_unref);
+      fpi_device_enroll_complete (dev, NULL, error);
+      return;
+    }
+
+  FpPrint *print = NULL;
+  fpi_device_get_enroll_data (dev, &print);
+  fpi_print_set_type (print, FPI_PRINT_RAW);
+
+  // Store the gallery as GVariant "aay": a stamp, then one fixed 8-bit frame per enrolled
+  // zone. We persist raw frames (not serialized SIFT descriptors) on purpose: the template
+  // stays independent of the matcher, so a future sigfm/algorithm change still matches old
+  // enrollments without re-enrolling. Trade-off (accepted): the print holds raw fingerprint
+  // images, and verify re-extracts SIFT each time (cheap at 56x176).
+  GVariantBuilder builder;
+  const guint8 stamp[GOODIX5F10_STAMP_LEN] = {
+    'G', 'X', '5', 'F', GOODIX5F10_PIPELINE_VERSION, self->sent_dac, self->sent_tcode
+  };
+
+  g_variant_builder_init (&builder, G_VARIANT_TYPE ("aay"));
+  g_variant_builder_add (&builder, "@ay",
+                         g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, stamp,
+                                                    sizeof (stamp), 1));
+  for (guint i = 0; i < self->enroll_images->len; i++)
+    {
+      guint8 *img = g_ptr_array_index (self->enroll_images, i);
+      g_variant_builder_add (&builder, "@ay",
+                             g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, img,
+                                                        GOODIX5F10_PIXELS, 1));
+    }
+  GVariant *data = g_variant_builder_end (&builder);
+  g_object_set (G_OBJECT (print), "fpi-data", data, NULL);
+  guint gallery_frames = self->enroll_images->len;
+  g_clear_pointer (&self->enroll_images, g_ptr_array_unref);
+
+  fp_info ("enrollment complete: %u gallery frames over %u touches",
+           gallery_frames, self->enroll_touches);
+  fpi_device_enroll_complete (dev, g_object_ref (print), NULL);
+}
+
+// ---- verify / identify SSM ------------------------------------------------------------
+
+enum verify_states {
+  VERIFY_CAPTURE,
+  VERIFY_MATCH,
+  VERIFY_NUM_STATES,
+};
+
+// Compare a stored stamp against the point this sensor runs at now. Mismatch is not a
+// refusal: on the gallery sizes the driver enrolls, a shifted operating point still matched
+// in testing, so refusing here would break people the sensor would have let in. It goes in
+// the log so that a failure nobody can otherwise explain has a first thing to look at.
+static void
+check_stamp (FpiDeviceGoodixTls5f10 *self, const guint8 *stamp)
+{
+  if (stamp[4] != GOODIX5F10_PIPELINE_VERSION)
+    fp_warn ("print was enrolled by pipeline version %u, this driver is version %u; "
+             "matching it anyway, but re-enrolling is the fix if it stops being recognised",
+             stamp[4], (guint) GOODIX5F10_PIPELINE_VERSION);
+  else if (stamp[5] != self->sent_dac || stamp[6] != self->sent_tcode)
+    fp_warn ("print was enrolled at DAC 0x%02x TCODE 0x%02x, this sensor runs at "
+             "0x%02x 0x%02x; matching it anyway",
+             stamp[5], stamp[6], self->sent_dac, self->sent_tcode);
+}
+
+// Score a set of probe frames (all grabbed from one finger press) against one stored
+// template's gallery (a GVariant "aay"). Each gallery sample is extracted once and matched
+// against every probe frame; the sample's score is the best over probes. Returns the best
+// score across all samples and the count of samples scoring >= THRESHOLD.
+static int
+score_template_multi (FpiDeviceGoodixTls5f10 *self, SigfmImgInfo **probes, guint n_probes,
+                      GVariant *tmpl_data, int *out_match_count)
+{
+  GVariantIter iter;
+  GVariant *child;
+  int best = 0, count = 0;
+
+  g_variant_iter_init (&iter, tmpl_data);
+  while ((child = g_variant_iter_next_value (&iter)))
+    {
+      gsize len;
+      const guint8 *img = g_variant_get_fixed_array (child, &len, 1);
+      if (len == GOODIX5F10_STAMP_LEN && memcmp (img, "GX5F", 4) == 0)
+        check_stamp (self, img);
+      else if (len == GOODIX5F10_PIXELS)
+        {
+          SigfmImgInfo *ti = sigfm_extract_ex (img, GOODIX5F10_WIDTH, GOODIX5F10_HEIGHT, GOODIX5F10_SIGFM_MAX_KP);
+          int sample_best = 0;
+          for (guint p = 0; p < n_probes; p++)
+            {
+              if (!probes[p]) continue;
+              int score = sigfm_match_score (probes[p], ti);
+              if (score > sample_best) sample_best = score;
+            }
+          sigfm_free_info (ti);
+          if (sample_best >= GOODIX5F10_SIGFM_THRESHOLD) count++;
+          if (sample_best > best) best = sample_best;
+        }
+      g_variant_unref (child);
+    }
+  *out_match_count = count;
+  return best;
+}
+
+static void
+verify_run_state (FpiSsm *ssm, FpDevice *dev)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case VERIFY_CAPTURE:
+      fpi_ssm_start_subsm (ssm, fpi_ssm_new (dev, capture_run_state, CAP_NUM_STATES));
+      break;
+
+    case VERIFY_MATCH:
+      {
+        FpiDeviceAction action = fpi_device_get_current_action (dev);
+
+        // Build a probe set from every frame grabbed during this press.
+        guint n_probes = self->capture_frames ? self->capture_frames->len : 0;
+        SigfmImgInfo **probes = g_new0 (SigfmImgInfo *, MAX (n_probes, 1));
+        g_autoptr (GString) kp_line = g_string_new ("SIGFM probe frames keypoints:");
+        for (guint i = 0; i < n_probes; i++)
+          {
+            guint8 *img = g_ptr_array_index (self->capture_frames, i);
+            probes[i] = sigfm_extract_ex (img, GOODIX5F10_WIDTH, GOODIX5F10_HEIGHT, GOODIX5F10_SIGFM_MAX_KP);
+            g_string_append_printf (kp_line, " %d", sigfm_keypoints_count (probes[i]));
+          }
+        fp_dbg ("%s", kp_line->str);
+
+        if (action == FPI_DEVICE_ACTION_IDENTIFY)
+          {
+            GPtrArray *gallery = NULL;
+            FpPrint *match = NULL;
+            int best_score = 0;
+
+            fpi_device_get_identify_data (dev, &gallery);
+            for (guint i = 0; gallery && i < gallery->len; i++)
+              {
+                FpPrint *tmpl = g_ptr_array_index (gallery, i);
+                GVariant *tdata = NULL;
+                g_object_get (G_OBJECT (tmpl), "fpi-data", &tdata, NULL);
+                if (!tdata) continue;
+                int mc = 0;
+                int best = score_template_multi (self, probes, n_probes, tdata, &mc);
+                g_variant_unref (tdata);
+                if (best >= GOODIX5F10_SIGFM_BEST_MIN &&
+                    mc >= GOODIX5F10_SIGFM_MIN_SAMPLES && best > best_score)
+                  {
+                    best_score = best;
+                    match = tmpl;
+                  }
+              }
+            fp_dbg ("identify best sigfm %d (%u probe frames)", best_score, n_probes);
+            fpi_device_identify_report (dev, match, NULL, NULL);
+          }
+        else
+          {
+            FpPrint *print = NULL;
+            GVariant *data = NULL;
+            int best = 0, mc = 0;
+
+            fpi_device_get_verify_data (dev, &print);
+            g_object_get (G_OBJECT (print), "fpi-data", &data, NULL);
+            if (data)
+              {
+                best = score_template_multi (self, probes, n_probes, data, &mc);
+                g_variant_unref (data);
+              }
+            fp_dbg ("verify best sigfm %d, matching samples %d over %u probe frames "
+                    "(thr %d/best %d/min %d)",
+                    best, mc, n_probes, GOODIX5F10_SIGFM_THRESHOLD,
+                    GOODIX5F10_SIGFM_BEST_MIN, GOODIX5F10_SIGFM_MIN_SAMPLES);
+            if (best >= GOODIX5F10_SIGFM_BEST_MIN && mc >= GOODIX5F10_SIGFM_MIN_SAMPLES)
+              fpi_device_verify_report (dev, FPI_MATCH_SUCCESS, NULL, NULL);
+            else
+              fpi_device_verify_report (dev, FPI_MATCH_FAIL, NULL, NULL);
+          }
+
+        for (guint i = 0; i < n_probes; i++)
+          if (probes[i]) sigfm_free_info (probes[i]);
+        g_free (probes);
+        g_clear_pointer (&self->capture_frames, g_ptr_array_unref);
+        fpi_ssm_next_state (ssm);
+      }
+      break;
+    }
+}
+
+static void
+verify_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+  FpiDeviceAction action = fpi_device_get_current_action (dev);
+
+  self->task_ssm = NULL;
+  g_clear_pointer (&self->capture_frames, g_ptr_array_unref);
+
+  if (action == FPI_DEVICE_ACTION_IDENTIFY)
+    fpi_device_identify_complete (dev, error);
+  else
+    fpi_device_verify_complete (dev, error);
+}
+
+// ---- FpDevice vfuncs ------------------------------------------------------------------
+
+// Load the 32-byte TLS-PSK from disk into `self`. The path is taken from the
+// GOODIX_5F10_PSK_FILE env var when set, otherwise from GOODIX_5F10_DEFAULT_PSK_FILE.
+//
+// When no usable key is present and automatic provisioning is enabled (the
+// default; GOODIX5F10_AUTOPROVISION=0 opts out), a fresh key is generated here
+// and written to the MCU later, at ACTIVATE_CHECK_PSK (the write needs the
+// pre-TLS transport, which only exists once activation has started).
+static gboolean
+load_secrets (FpiDeviceGoodixTls5f10 *self, GError **error)
+{
+  const gchar *psk_path = g_getenv (GOODIX_5F10_PSK_FILE_ENV);
+  const gboolean autoprovision =
+    goodix5f10_autoprovision_enabled (g_getenv (GOODIX_5F10_AUTOPROVISION_ENV));
+  g_autofree gchar *data = NULL;
+  gsize length = 0;
+  g_autoptr (GError) inner = NULL;
+
+  if (!psk_path) psk_path = GOODIX_5F10_DEFAULT_PSK_FILE;
+  self->psk_path = g_strdup (psk_path);
+
+  if (g_file_get_contents (psk_path, &data, &length, &inner)
+      && length == GOODIX_5F10_PSK_LEN)
+    {
+      memcpy (self->tls_psk, data, GOODIX_5F10_PSK_LEN);
+      self->psk_from_disk = TRUE;
+      self->provisioning = FALSE;
+      return TRUE;
+    }
+
+  if (autoprovision)
+    {
+      g_autofree guint8 *fresh = NULL;
+
+      if (!goodix5f10_psk_selftest ())
+        {
+          g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
+                       "goodixtls5f10: internal PSK packer self-test failed; "
+                       "refusing to provision");
+          return FALSE;
+        }
+
+      fresh = goodix5f10_psk_random_psk ();
+      if (fresh == NULL)
+        {
+          g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
+                       "goodixtls5f10: could not generate a random PSK");
+          return FALSE;
+        }
+
+      memcpy (self->tls_psk, fresh, GOODIX_5F10_PSK_LEN);
+      self->psk_from_disk = FALSE;
+      self->provisioning = TRUE;
+      fp_info ("no PSK at \"%s\" (%s); a fresh one will be generated and written "
+               "to the sensor during activation", psk_path,
+               inner ? inner->message : "wrong file length");
+      return TRUE;
+    }
+
+  g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
+               "goodixtls5f10: no TLS-PSK at \"%s\" (%s) and automatic "
+               "provisioning is off. Set %s=1 to generate and write one "
+               "automatically, or provision one out-of-band with the companion "
+               "tool. Alternatively place exactly 32 raw bytes at the path "
+               "above (overridable via %s).",
+               psk_path, inner ? inner->message : "wrong file length",
+               GOODIX_5F10_AUTOPROVISION_ENV, GOODIX_5F10_PSK_FILE_ENV);
+  return FALSE;
+}
+
+static void
+dev_open (FpDevice *dev)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+  GError *error = NULL;
+
+  if (!load_secrets (self, &error))
+    {
+      fpi_device_open_complete (dev, error);
+      return;
+    }
+
+  // goodix_dev_init() returns TRUE on success (it returns g_usb_device_claim_interface).
+  if (!goodix_dev_init (dev, &error))
+    {
+      fpi_device_open_complete (dev, error);
+      return;
+    }
+  // Feed the per-device TLS session PSK to the OpenSSL server callback.
+  goodix_tls_set_psk (self->tls_psk, GOODIX_5F10_PSK_LEN);
+
+  self->task_ssm = fpi_ssm_new (dev, activate_run_state, ACTIVATE_NUM_STATES);
+  fpi_ssm_start (self->task_ssm, activate_complete);
+}
+
+static void
+dev_close (FpDevice *dev)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+  GError *error = NULL;
+
+  g_clear_pointer (&self->calibration_img, g_free);
+  g_clear_pointer (&self->capture_frames, g_ptr_array_unref);
+  g_clear_pointer (&self->enroll_images, g_ptr_array_unref);
+  g_clear_pointer (&self->psk_path, g_free);
+
+  goodix_reset_state (dev);
+  goodix_shutdown_tls (dev, &error);
+  goodix_dev_deinit (dev, &error);
+
+  fpi_device_close_complete (dev, error);
+}
+
+static void
+dev_enroll (FpDevice *dev)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+
+  self->enroll_touches = 0;
+  self->enroll_ignored = 0;
+  self->frames_target = GOODIX5F10_ENROLL_FRAMES;
+  g_clear_pointer (&self->enroll_images, g_ptr_array_unref);
+  self->enroll_images = g_ptr_array_new_with_free_func (g_free);
+  g_clear_pointer (&self->calibration_img, g_free);
+
+  // Fixed-count enroll knobs (env-overridable for live FAR/FRR tuning without a rebuild).
+  self->enroll_target = env_uint ("GOODIX5F10_ENROLL_SAMPLES", GOODIX5F10_ENROLL_SAMPLES);
+  self->enroll_min_kp = env_uint ("GOODIX5F10_ENROLL_MIN_KP", GOODIX5F10_ENROLL_MIN_KP);
+  fp_dbg ("enroll: collecting %u samples (min %u keypoints/frame)",
+          self->enroll_target, self->enroll_min_kp);
+
+  self->task_ssm = fpi_ssm_new (dev, enroll_run_state, ENROLL_NUM_STATES);
+  fpi_ssm_start (self->task_ssm, enroll_complete);
+}
+
+static void
+dev_verify (FpDevice *dev)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+
+  self->frames_target = GOODIX5F10_VERIFY_FRAMES;
+  g_clear_pointer (&self->calibration_img, g_free);
+
+  self->task_ssm = fpi_ssm_new (dev, verify_run_state, VERIFY_NUM_STATES);
+  fpi_ssm_start (self->task_ssm, verify_complete);
+}
+
+static void
+dev_identify (FpDevice *dev)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+
+  self->frames_target = GOODIX5F10_VERIFY_FRAMES;
+  g_clear_pointer (&self->calibration_img, g_free);
+
+  self->task_ssm = fpi_ssm_new (dev, verify_run_state, VERIFY_NUM_STATES);
+  fpi_ssm_start (self->task_ssm, verify_complete);
+}
+
+static void
+dev_cancel (FpDevice *dev)
+{
+  // Abort the in-flight USB transfer via the base transport's cancel token (the driver has
+  // no transfers of its own). Without this, a cancel while waiting for a finger is a no-op.
+  goodix_cancel (dev);
+}
+
+static void
+fpi_device_goodixtls5f10_init (FpiDeviceGoodixTls5f10 *self)
+{
+  // Seed with the development unit's table so the first FDT command has something to
+  // send; update_fdt_base replaces it with this sensor's own on the first reply.
+  memcpy (self->fdt_base, fdt_reference_thresholds, sizeof (self->fdt_base));
+}
+
+static const FpIdEntry id_table[] = {
+  {.vid = 0x27c6, .pid = 0x5f10},
+  {.vid = 0, .pid = 0, .driver_data = 0},
+};
+
+static void
+fpi_device_goodixtls5f10_class_init (FpiDeviceGoodixTls5f10Class *class)
+{
+  FpiDeviceGoodixTlsClass *gx_class = FPI_DEVICE_GOODIXTLS_CLASS (class);
+  FpDeviceClass *dev_class = FP_DEVICE_CLASS (class);
+
+  gx_class->interface = GOODIX_5F10_INTERFACE;
+  gx_class->ep_in = GOODIX_5F10_EP_IN;
+  gx_class->ep_out = GOODIX_5F10_EP_OUT;
+
+  dev_class->id = "goodixtls5f10";
+  dev_class->full_name = "Goodix TLS Fingerprint Sensor 5F10";
+  dev_class->type = FP_DEVICE_TYPE_USB;
+  dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+  dev_class->id_table = id_table;
+  // Fixed number of enrollment samples; progress (gallery size) maps 1:1 onto the UI bar.
+  dev_class->nr_enroll_stages = GOODIX5F10_ENROLL_SAMPLES;
+  dev_class->temp_hot_seconds = -1; // small sensor, no thermal throttle
+  dev_class->features = FP_DEVICE_FEATURE_VERIFY | FP_DEVICE_FEATURE_IDENTIFY;
+
+  dev_class->open = dev_open;
+  dev_class->close = dev_close;
+  dev_class->enroll = dev_enroll;
+  dev_class->verify = dev_verify;
+  dev_class->identify = dev_identify;
+  dev_class->cancel = dev_cancel;
+}
