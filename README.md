@@ -76,7 +76,19 @@ least the partition left in place. Recover the key Windows already holds with th
 It reads the key offline and read-only off the Windows partition and drops it at
 `/var/lib/fprint/goodix-5f10/psk`. Without that file the driver fails activation
 with a clear message telling you where to put it. On a Linux-only machine there is
-no path around this.
+no path around this (unless you opt in to Linux-side provisioning, below).
+
+## Optional: provisioning the key from Linux
+
+By default the driver only reads the key (see above). If you set `GOODIX5F10_AUTOPROVISION=1` for
+fprintd, it can also create one: when no key file exists it generates a key, writes it to the sensor and
+saves it to `/var/lib/fprint/goodix-5f10/psk`. If the stored key no longer matches the sensor, it is
+written again.
+
+This writes to the sensor, so enable it deliberately. On dual-boot machines the Windows driver uses the
+same key slot (seen on one machine, see [issue #5](https://github.com/Sbenazar/goodix-5f10-libfprint/issues/5)).
+If you do not want Linux to write anything, recover the key from Windows with
+[goodix-5f10-psk](https://github.com/Sbenazar/goodix-5f10-psk) as described above.
 
 ## Build
 
