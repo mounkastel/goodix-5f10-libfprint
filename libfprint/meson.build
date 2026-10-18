@@ -136,6 +136,7 @@ driver_sources = {
     ),
     'goodixtls5f10' : files(
         'drivers/goodixtls/goodix5f10.c',
+        'drivers/goodixtls/goodix5f10_psk.c',
         'drivers/goodixtls/sigfm.c',
     ),
     'fpcmoc' : files('drivers/fpcmoc/fpc.c'),
