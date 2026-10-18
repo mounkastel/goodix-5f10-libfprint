@@ -66,6 +66,7 @@
 #define GOODIX_CMD_REQUEST_TLS_CONNECTION (0xd0)       // (cmd0=13,cmd1=0) start TLS-PSK handshake
 #define GOODIX_CMD_TLS_SUCCESSFULLY_ESTABLISHED (0xd4) // (cmd0=13,cmd1=2) confirm TLS up
 #define GOODIX_CMD_PRESET_PSK_READ (0xe4)              // (cmd0=14,cmd1=2) read provisioning PSK
+#define GOODIX_CMD_PRESET_PSK_WRITE (0xe0)             // (cmd0=14,cmd1=0) write provisioning PSK
 
 // ---- No-reply / fire-and-forget variants (low bit set) ----
 // These send the SAME command on the chip side, but the host does NOT block for the

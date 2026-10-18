@@ -1104,6 +1104,36 @@ goodix_send_preset_psk_read (FpDevice *dev, guint32 flags, guint16 length,
                         NULL);
 }
 
+void
+goodix_send_preset_psk_write (FpDevice *dev, const guint8 *payload,
+                              guint16 length, GoodixDefaultCallback callback,
+                              gpointer user_data)
+{
+  GoodixCallbackInfo *cb_info;
+
+  /*
+   * Mirrors goodix_send_preset_psk_read: the vendor driver issues the write
+   * through the same production layer as the read (same cmd nibbles, same
+   * calc-checksum flag, same 1000 ms wait for the chip's reply) and simply
+   * discards the reply body, so we ask for a reply and ignore it too.
+   */
+  if (callback)
+    {
+      cb_info = malloc (sizeof (GoodixCallbackInfo));
+
+      cb_info->callback = G_CALLBACK (callback);
+      cb_info->user_data = user_data;
+
+      goodix_send_protocol (dev, GOODIX_CMD_PRESET_PSK_WRITE, (guint8 *) payload,
+                            length, NULL, TRUE, GOODIX_TIMEOUT, TRUE,
+                            goodix_receive_default, cb_info);
+      return;
+    }
+
+  goodix_send_protocol (dev, GOODIX_CMD_PRESET_PSK_WRITE, (guint8 *) payload,
+                        length, NULL, TRUE, GOODIX_TIMEOUT, TRUE, NULL, NULL);
+}
+
 // ---- GOODIX SEND SECTION END ----
 
 // -----------------------------------------------------------------------------

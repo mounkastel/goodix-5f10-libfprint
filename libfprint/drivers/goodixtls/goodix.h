@@ -453,6 +453,25 @@ void goodix_send_preset_psk_read (FpDevice                   *dev,
                                   GoodixPresetPskReadCallback callback,
                                   gpointer                    user_data);
 /**
+ * @brief Write a (previously generated) PSK to the MCU with command 0xE0.
+ *
+ * The payload is the packed write blob (see goodix5f10_psk.h).  The MCU stores
+ * it, keeps its own copy verbatim and starts answering the 0xBB020003 hash read
+ * with SHA256(TLV-1 body).  This is a plain pre-TLS command, so it can run
+ * before any TLS session exists.
+ *
+ * @param dev
+ * @param payload the packed write blob
+ * @param length length of @p payload
+ * @param callback
+ * @param user_data
+ */
+void goodix_send_preset_psk_write (FpDevice             *dev,
+                                   const guint8         *payload,
+                                   guint16               length,
+                                   GoodixDefaultCallback callback,
+                                   gpointer              user_data);
+/**
  * @brief Request the OTP (One Time Password) from the device
  *
  * @param dev
