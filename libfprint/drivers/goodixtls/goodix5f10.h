@@ -13,8 +13,11 @@
 //   - config table: the vendor's default 5F10 profile, 224 bytes
 //   - geometry: 56 px scan width x 176 scanlines (9856 px; RAW_FRAME_SIZE == 14797)
 //
-// The TLS-PSK session key is NOT compiled in. It is device-specific and loaded at
-// activation time from disk (see the PSK_FILE path below and load_secrets()).
+// The TLS-PSK session key is NOT compiled in. It is host-generated (32 random
+// bytes) and loaded at activation time from disk; when provisioning is opted
+// in with GOODIX5F10_AUTOPROVISION=1, a fresh key is also generated here and
+// written to the MCU itself (see the PSK_FILE path below, load_secrets() and
+// goodix5f10_psk.[ch]).
 
 #pragma once
 

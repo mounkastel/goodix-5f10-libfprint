@@ -27,26 +27,37 @@
 //   * Sensor streams 9856 px decoded row-major as 176 scanlines x 56 px, presented
 //     STRAIGHT (no transpose) with ridges inverted dark (see process_to_8bit).
 //
-// Per-device secrets (TLS-PSK session key + 32-byte preset-PSK identity hash)
-// are loaded at activation from disk; see load_secrets() and the file paths in
-// goodix5f10.h. They are device-specific and not compiled in.
+// The TLS-PSK session key is a host-generated 32-byte secret: by default the
+// driver only loads it from disk, and a missing or mismatching key fails the
+// open. Setting GOODIX5F10_AUTOPROVISION=1 opts in to provisioning: the key is
+// then also written to the MCU with command 0xE0 at activation (see
+// goodix5f10_psk.[ch]). The 32-byte value the chip reports on a 0xE4 read is a
+// hash of the packed key; on the unit tested (FMI-76, firmware 12705) the chip
+// accepted a host-generated key and its read-back hash matched SHA256 of the
+// packed TLV-1 body. See load_secrets() and the paths in goodix5f10.h.
 
 #include "fp-device.h"
 #include "fpi-device.h"
 #include "fpi-ssm.h"
 #include "gusb/gusb-device.h"
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <glib.h>
+#include <glib/gstdio.h>
 
 #include <openssl/ssl.h> // goodixtls.h references SSL/SSL_CTX types
+#include <openssl/crypto.h> // OPENSSL_cleanse: clear the session key on close
 
 #include "drivers_api.h"
 #include "goodix.h"
 #include "goodix_proto.h"
 #include "goodixtls.h"
 #include "goodix5f10.h"
+#include "goodix5f10_psk.h"
 #include "sigfm.h"
 
 #define FP_COMPONENT "goodixtls5f10"
@@ -154,6 +165,17 @@ G_STATIC_ASSERT (GOODIX5F10_STAMP_LEN != GOODIX5F10_PIXELS);
 
 typedef guint16 Goodix5f10Pix;
 
+// Optional automatic provisioning, off by default: with
+// GOODIX5F10_AUTOPROVISION=1 the driver generates a 32-byte PSK and writes it
+// to the MCU during activation whenever there is no usable key on disk, or the
+// one on disk does not match the sensor. Without it nothing is ever written:
+// a missing or mismatching key fails the open instead.
+#define GOODIX_5F10_AUTOPROVISION_ENV "GOODIX5F10_AUTOPROVISION"
+
+// Length of the host-backup section in the 0xE0 payload. The MCU stores it
+// verbatim and never reads it, so any length works -- we just keep a fixed shape.
+#define GOODIX_5F10_SEALED_LEN (324)
+
 struct _FpiDeviceGoodixTls5f10
 {
   FpiDeviceGoodixTls parent;
@@ -188,8 +210,12 @@ struct _FpiDeviceGoodixTls5f10
   guint8     fdt_base[GOODIX5F10_FDT_PAYLOAD_LEN];
   gboolean   fdt_base_live;       // TRUE once the table came from a live reading
 
-  // Per-device TLS session key loaded from disk at activation.
+  // Per-device TLS session key. Loaded from disk; generated and written to
+  // the MCU at ACTIVATE_CHECK_PSK when provisioning is opted in (see the
+  // AUTOPROVISION define above).
   guint8     tls_psk[GOODIX_5F10_PSK_LEN];
+  gchar     *psk_path;            // where tls_psk is (or will be) persisted
+  gboolean   psk_from_disk;       // tls_psk came from an existing file
 };
 
 G_DECLARE_FINAL_TYPE (FpiDeviceGoodixTls5f10, fpi_device_goodixtls5f10, FPI,
@@ -420,33 +446,215 @@ check_firmware (FpDevice *dev, gchar *firmware, gpointer ssm, GError *error)
   fpi_ssm_next_state (ssm);
 }
 
+// ---- Optional PSK provisioning (only runs with GOODIX5F10_AUTOPROVISION=1) -----
+//
+// The host picks 32 random bytes, wraps them with the static key described
+// in goodix5f10_psk.c, writes the blob with command 0xE0 and keeps a host copy for
+// itself. On the unit tested (FMI-76, firmware 12705) the chip accepted a
+// host-generated key and its read-back hash matched SHA256 of the packed
+// TLV-1 body.
+
+// Persist the raw key so later opens can reuse it. Best effort: the key lives in
+// the sensor already, so a failure here only means the next open re-provisions.
+// `from_disk` selects the success message: a stored key being restored reads
+// differently from a freshly generated one.
+static void
+save_psk (const gchar *path, const guint8 psk[GOODIX_5F10_PSK_LEN],
+          gboolean from_disk)
+{
+  g_autofree gchar *dir = NULL;
+  gsize written = 0;
+  int fd;
+  int save_errno = 0;
+
+  // The directory is created 0700; an existing one is left as it is
+  // (g_mkdir_with_parents only fails when it cannot reach the leaf).
+  dir = g_path_get_dirname (path);
+  if (g_mkdir_with_parents (dir, 0700) != 0)
+    fp_warn ("could not create PSK dir \"%s\": %s", dir, g_strerror (errno));
+
+  // O_CREAT|O_TRUNC with 0600 up front: the file never momentarily exists
+  // readable by other users, which an open-then-chmod sequence would allow.
+  fd = g_open (path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0)
+    {
+      fp_warn ("the sensor is provisioned, but the key could not be saved to "
+               "\"%s\": %s; record the raw 32 bytes yourself or the next open "
+               "will start over", path, g_strerror (errno));
+      return;
+    }
+
+  while (written < GOODIX_5F10_PSK_LEN)
+    {
+      const gssize chunk = write (fd, psk + written, GOODIX_5F10_PSK_LEN - written);
+
+      if (chunk < 0)
+        {
+          if (errno == EINTR)
+            continue;
+          save_errno = errno;
+          break;
+        }
+      if (chunk == 0)
+        {
+          // No progress is possible and write neither errors nor finishes;
+          // treat it as an error instead of looping forever.
+          save_errno = EIO;
+          break;
+        }
+      written += chunk;
+    }
+  close (fd);
+
+  if (written != GOODIX_5F10_PSK_LEN)
+    {
+      // save_errno is from the write, not from close(), which has already
+      // run. Either way the sensor still holds the key meanwhile.
+      fp_warn ("the sensor is provisioned, but the key could not be saved to "
+               "\"%s\" (wrote %u of %u bytes): %s; record the raw 32 bytes "
+               "yourself or the next open will start over", path, (guint) written,
+               (guint) GOODIX_5F10_PSK_LEN, g_strerror (save_errno));
+      return;
+    }
+  if (from_disk)
+    fp_info ("re-provisioned the sensor from the stored PSK");
+  else
+    fp_info ("generated and saved a new PSK to \"%s\"", path);
+}
+
+static void
+provision_verify (FpDevice *dev, gboolean success, guint32 flags, guint8 *psk,
+                  guint16 length, gpointer ssm, GError *error)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+  guint8 want[GOODIX5F10_PSK_HASH_LEN];
+
+  if (error) { fpi_ssm_mark_failed (ssm, error); return; }
+
+  if (!success || flags != GOODIX_5F10_PSK_FLAGS || length != GOODIX_5F10_PSK_LEN
+      || !goodix5f10_psk_host_hash (self->tls_psk, want)
+      || memcmp (want, psk, GOODIX5F10_PSK_HASH_LEN) != 0)
+    {
+      fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+          "the PSK write did not take (read-back: success=%d flags=0x%08x len=%u)",
+          success, flags, length));
+      return;
+    }
+
+  /* psk_from_disk still tells where the key came from here: TRUE when the
+   * stored file key is being restored, FALSE for a freshly generated one
+   * (it flips to TRUE below). */
+  save_psk (self->psk_path, self->tls_psk, self->psk_from_disk);
+  self->psk_from_disk = TRUE;
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+provision_written (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
+                   GError *error)
+{
+  if (error) { fpi_ssm_mark_failed (ssm, error); return; }
+  fp_dbg ("PSK write acknowledged; reading it back to verify");
+  goodix_send_preset_psk_read (dev, GOODIX_5F10_PSK_FLAGS, 0, provision_verify, ssm);
+}
+
+static void
+provision_start (FpDevice *dev, FpiSsm *ssm)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+  g_autofree guint8 *blob = NULL;
+  gsize len = 0;
+
+  blob = goodix5f10_psk_build_write (self->tls_psk, GOODIX_5F10_SEALED_LEN, &len);
+  if (blob == NULL || len == 0 || len > G_MAXUINT16)
+    {
+      fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED,
+                                             "failed to build the PSK write payload"));
+      return;
+    }
+
+  if (self->psk_from_disk)
+    fp_info ("writing the stored PSK to the sensor (command 0xE0, %" G_GSIZE_FORMAT
+             " bytes)", len);
+  else
+    fp_info ("writing a freshly generated PSK to the sensor (command 0xE0, %"
+             G_GSIZE_FORMAT " bytes)", len);
+  goodix_send_preset_psk_write (dev, blob, (guint16) len, provision_written, ssm);
+}
+
 static void
 check_preset_psk (FpDevice *dev, gboolean success, guint32 flags, guint8 *psk,
                   guint16 length, gpointer ssm, GError *error)
 {
-  g_autofree gchar *psk_str = NULL;
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+  const gboolean autoprovision =
+    goodix5f10_autoprovision_enabled (g_getenv (GOODIX_5F10_AUTOPROVISION_ENV));
 
   if (error) { fpi_ssm_mark_failed (ssm, error); return; }
-  if (!success)
+
+  switch (goodix5f10_psk_decide (success, flags, length, psk, length,
+                                 self->tls_psk, autoprovision))
     {
+    case GOODIX5F10_PSK_MATCH:
+      {
+        g_autofree gchar *dev_hash = data_to_str (psk, length);
+        fp_dbg ("device PSK hash 0x%s matches the stored key", dev_hash);
+        fpi_ssm_next_state (ssm);
+        return;
+      }
+
+    case GOODIX5F10_PSK_MISMATCH_AUTOPROVISION:
+      fp_warn ("device PSK differs from the stored key; re-provisioning");
+      break;
+
+    case GOODIX5F10_PSK_MISMATCH_FAIL:
+      {
+        /* A wrong key can never complete TLS: fail here with the cause named,
+         * instead of continuing into a handshake that dies as a timeout. The
+         * decision above already guarantees flags/length are the slot's own,
+         * so both hashes are 32 bytes; show the short forms. */
+        g_autofree gchar *dev_hash = data_to_str (psk, GOODIX5F10_PSK_HASH_LEN);
+        guint8 want[GOODIX5F10_PSK_HASH_LEN];
+        g_autofree gchar *want_hash = NULL;
+
+        if (goodix5f10_psk_host_hash (self->tls_psk, want))
+          want_hash = data_to_str (want, GOODIX5F10_PSK_HASH_LEN);
+        dev_hash[8] = '\0';
+        if (want_hash != NULL)
+          want_hash[8] = '\0';
+
+        fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+            "sensor TLS-PSK 0x%s does not match the stored key 0x%s, and the "
+            "driver writes nothing until provisioning is opted in; refusing to "
+            "continue with a key the sensor will not accept. Set %s=1 to "
+            "re-provision from the stored file, or restore the PSK file that "
+            "matches the sensor key.",
+            dev_hash, want_hash ? want_hash : "(unavailable)",
+            GOODIX_5F10_AUTOPROVISION_ENV));
+        return;
+      }
+
+    case GOODIX5F10_PSK_MISSING:
+    case GOODIX5F10_PSK_REPLY_INVALID:
+      if (autoprovision)
+        {
+          fp_info ("sensor reports no usable PSK; provisioning one now");
+          break;
+        }
+      fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+          "Unexpected PSK reply: success=%d flags=0x%08x len=%u. The driver "
+          "writes nothing until provisioning is opted in; set %s=1 to provision "
+          "a key automatically.", success, flags, length,
+          GOODIX_5F10_AUTOPROVISION_ENV));
+      return;
+
+    case GOODIX5F10_PSK_IO_ERROR:
       fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED,
-                                             "Failed to read PSK from device"));
+                                            "failed to hash the stored PSK"));
       return;
     }
 
-  // Log only. The chip-side hash is per-device and cannot be computed from the
-  // PSK alone without vendor master keys, so we cannot meaningfully compare it
-  // here. A wrong PSK is caught later by the TLS-PSK handshake failing.
-  psk_str = data_to_str (psk, length);
-  fp_dbg ("Device PMK hash: 0x%s (flags 0x%08x)", psk_str, flags);
-  if (flags != GOODIX_5F10_PSK_FLAGS || length != GOODIX_5F10_PSK_LEN)
-    {
-      fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
-                                             "Unexpected PSK reply: flags=0x%08x len=%u",
-                                             flags, length));
-      return;
-    }
-  fpi_ssm_next_state (ssm);
+  provision_start (dev, ssm);
 }
 
 static void
@@ -1286,39 +1494,102 @@ verify_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 
 // ---- FpDevice vfuncs ------------------------------------------------------------------
 
-// Load the 32-byte per-device TLS-PSK from disk into `self`.
-// The path is taken from the GOODIX_5F10_PSK_FILE env var when set, otherwise
-// from GOODIX_5F10_DEFAULT_PSK_FILE. On failure returns FALSE and `error`
-// carries a message that names the missing file and points the user at the
-// companion PSK extraction tool.
+// Load the 32-byte TLS-PSK from disk into `self`. The path is taken from the
+// GOODIX_5F10_PSK_FILE env var when set, otherwise from GOODIX_5F10_DEFAULT_PSK_FILE.
+//
+// A fresh key is only generated when the file is simply absent AND provisioning
+// is opted in with GOODIX5F10_AUTOPROVISION=1; it is written to the MCU later,
+// at ACTIVATE_CHECK_PSK (the write needs the pre-TLS transport, which only
+// exists once activation has started). Every other file problem -- unreadable
+// (permissions, SELinux denial, I/O error) or a length other than exactly 32
+// bytes -- fails the open and never replaces what is on disk: a key recovered
+// from Windows must not be quietly regenerated just because we cannot read it.
 static gboolean
 load_secrets (FpiDeviceGoodixTls5f10 *self, GError **error)
 {
   const gchar *psk_path = g_getenv (GOODIX_5F10_PSK_FILE_ENV);
+  const gboolean autoprovision =
+    goodix5f10_autoprovision_enabled (g_getenv (GOODIX_5F10_AUTOPROVISION_ENV));
   g_autofree gchar *data = NULL;
   gsize length = 0;
   g_autoptr (GError) inner = NULL;
 
   if (!psk_path) psk_path = GOODIX_5F10_DEFAULT_PSK_FILE;
+  self->psk_path = g_strdup (psk_path);
 
-  if (!g_file_get_contents (psk_path, &data, &length, &inner) ||
-      length != GOODIX_5F10_PSK_LEN)
+  if (g_file_get_contents (psk_path, &data, &length, &inner))
     {
-      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
-                   "goodixtls5f10: failed to load TLS-PSK from \"%s\" (%s). "
-                   "The 5F10 sensor uses a device-specific TLS-PSK that the chip "
-                   "is provisioned with at the factory and cannot be derived from "
-                   "scratch on Linux. Place exactly 32 raw bytes at the above "
-                   "path (overridable via the %s environment variable). See the "
-                   "libfprint goodix-5f10 documentation for the companion "
-                   "extraction tool.",
-                   psk_path,
-                   inner ? inner->message : "wrong file length",
-                   GOODIX_5F10_PSK_FILE_ENV);
-      return FALSE;
+      if (length != GOODIX_5F10_PSK_LEN)
+        {
+          // Readable, but not 32 bytes. Never repair this by generating: a
+          // wrong file is more likely to be good data in the wrong shape
+          // than an invitation to overwrite the sensor's key.
+          g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
+                       "goodixtls5f10: the TLS-PSK file \"%s\" is %u bytes "
+                       "long, expected exactly %u; not loading it and not "
+                       "replacing it",
+                       psk_path, (guint) length, (guint) GOODIX_5F10_PSK_LEN);
+          return FALSE;
+        }
+
+      memcpy (self->tls_psk, data, GOODIX_5F10_PSK_LEN);
+      // The file's raw copy is freed below; do not leave the key behind.
+      OPENSSL_cleanse (data, length);
+      self->psk_from_disk = TRUE;
+      return TRUE;
     }
-  memcpy (self->tls_psk, data, GOODIX_5F10_PSK_LEN);
-  return TRUE;
+
+  if (g_error_matches (inner, G_FILE_ERROR, G_FILE_ERROR_NOENT))
+    {
+      if (!autoprovision)
+        {
+          g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
+                       "goodixtls5f10: no TLS-PSK at \"%s\" and automatic "
+                       "provisioning is off. Set %s=1 to generate and write "
+                       "one automatically, or recover the Windows driver's "
+                       "key with the goodix-5f10-psk companion tool, or place "
+                       "exactly %u raw bytes there (overridable via %s).",
+                       psk_path, GOODIX_5F10_AUTOPROVISION_ENV,
+                       (guint) GOODIX_5F10_PSK_LEN, GOODIX_5F10_PSK_FILE_ENV);
+          return FALSE;
+        }
+
+      // Plain absence with provisioning opted in: generate.
+      if (!goodix5f10_psk_selftest ())
+        {
+          g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
+                       "goodixtls5f10: internal PSK packer self-test failed; "
+                       "refusing to provision");
+          return FALSE;
+        }
+
+      g_autofree guint8 *fresh = goodix5f10_psk_random_psk ();
+      if (fresh == NULL)
+        {
+          g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
+                       "goodixtls5f10: could not generate a random PSK");
+          return FALSE;
+        }
+
+      memcpy (self->tls_psk, fresh, GOODIX_5F10_PSK_LEN);
+      // The scratch copy dies with the scope below; do not leave the key.
+      OPENSSL_cleanse (fresh, GOODIX_5F10_PSK_LEN);
+      self->psk_from_disk = FALSE;
+      fp_info ("no PSK at \"%s\"; a fresh one will be generated and written "
+               "to the sensor during activation", psk_path);
+      return TRUE;
+    }
+
+  // Any other read failure: fail, name the cause, and do not touch the key
+  // that is (or may be) stored there. A recovered-from-Windows key behind an
+  // SELinux denial is not the same thing as a missing one.
+  g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
+               "goodixtls5f10: could not read the TLS-PSK from \"%s\" (%s); "
+               "not replacing it. Fix access to that path (check permissions "
+               "or SELinux/AppArmor), or point %s at a readable key file.",
+               psk_path, inner ? inner->message : "unknown error",
+               GOODIX_5F10_PSK_FILE_ENV);
+  return FALSE;
 }
 
 static void
@@ -1355,10 +1626,15 @@ dev_close (FpDevice *dev)
   g_clear_pointer (&self->calibration_img, g_free);
   g_clear_pointer (&self->capture_frames, g_ptr_array_unref);
   g_clear_pointer (&self->enroll_images, g_ptr_array_unref);
+  g_clear_pointer (&self->psk_path, g_free);
 
   goodix_reset_state (dev);
   goodix_shutdown_tls (dev, &error);
   goodix_dev_deinit (dev, &error);
+
+  // TLS is down; do not leave the session key in the instance. The next open
+  // reloads it from disk (and, when opted in, re-provisions if it changed).
+  OPENSSL_cleanse (self->tls_psk, sizeof (self->tls_psk));
 
   fpi_device_close_complete (dev, error);
 }
